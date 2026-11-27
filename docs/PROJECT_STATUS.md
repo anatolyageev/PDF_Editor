@@ -211,20 +211,54 @@ reported against commit `051d9b5` before proceeding to `T-02`:
 - Next ready task in [TASKS.md](TASKS.md): `T-03` (drag-and-drop import, visual
   Front/Back slot cards, and source badges).
 
+### `T-03` (2026-11-27) — Drag-and-drop import, Front/Back slot cards & source badges
+
+- Added `partition_dropped_urls`, `SourceListWidget`, `SideSlotCard`, and
+  `render_source_item_icon` in `src/cardprint/ui/window.py`, plus matching QSS rules
+  (`slot="side"`, `pill="status"`, `role="slotPreview"`, `variant="slotClear"`) in
+  `src/cardprint/ui/theme.py`.
+- Enabled local `.pdf` / `.jpg` / `.jpeg` / `.png` file drops on `MainWindow`,
+  `SourceListWidget`, and `SideSlotCard` (rejecting non-local URLs and unsupported files
+  with Russian warnings while validating mixed drops per file), and wired internal
+  session-scoped source-ID drag-and-drop (`application/x-cardprint-source-id`) from
+  source thumbnails onto Front/Back slots while preserving labelled keyboard buttons.
+- Replaced `side_combo` with clickable/keyboard-accessible `front_slot` / `back_slot`
+  (`select_side`, `remove_side(side=...)`, quick clear `×`, mini-preview, and live status
+  pills: «Не назначена», «⟳ Загрузка…», «✓ Готово», «⚠ Проверьте границы»,
+  «✕ Ошибка выделения»), added `Лиц.` / `Обр.` thumbnail badges, distinguished
+  automatic-contour review (`_needs_contour_review`) from export readiness, and
+  guarded `_side_selection_seq` so late side loads never override a user's newer
+  active-side choice.
+- Updated `scripts/gui_smoke.py` and `tests/test_ui.py` (`select_side`), and added
+  3 new UI tests in `tests/test_ui.py` covering file/mixed/remote drops, internal-ID
+  thumbnail drag-and-drop, badges, slot clear/Undo, failure preservation, auto-review
+  distinction, and late-load focus preservation (`Qt offscreen`).
+- Next ready task in [TASKS.md](TASKS.md): `T-04` (corner editor UX upgrades: mask,
+  numbered handles, live error, loupe, shortcuts).
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-02` on 2026-11-27**
+The following results were obtained **after completing `T-03` on 2026-11-27**
 (Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows,
 display-backend screenshots, and 125%/150% HiDPI scaling remain separately unverified):
 
 | Check | Result and scope |
 | --- | --- |
-| `uv run pytest -q tests/test_ui.py` | **23 passed** (`14.19s`), Qt `offscreen`. |
-| `uv run pytest -q` | **73 passed** (`19.57s`), Qt `offscreen` (includes the 3 new `T-02` tests in `tests/test_ui.py`). |
+| `uv run pytest -q tests/test_ui.py` | **26 passed** (`17.39s`), Qt `offscreen`. |
+| `uv run pytest -q` | **76 passed** (`22.15s`), Qt `offscreen` (includes the 3 new `T-03` tests in `tests/test_ui.py`). |
 | `uv run ruff check src tests scripts` | All checks passed. |
 | `uv run ruff format --check src tests scripts` | 22 files already formatted. |
 
-`gui_smoke.py` was not rerun for `T-02`; its latest recorded run remains from `T-19` on 2026-11-27.
+`gui_smoke.py` was not rerun for `T-03`; its latest recorded run remains from `T-19` on 2026-11-27.
+
+Previous `T-02` verification checks (2026-11-27, commit `d536c85`):
+
+| Check | Result and scope |
+| --- | --- |
+| `uv run pytest -q tests/test_ui.py` | **23 passed** (`14.19s`), Qt `offscreen`. |
+| `uv run pytest -q` | **73 passed** (`19.57s`), Qt `offscreen`. |
+| `uv run ruff check src tests scripts` | All checks passed. |
+| `uv run ruff format --check src tests scripts` | 22 files already formatted. |
 
 Previous post-`051d9b5` review-fix checks (2026-11-27, commit `9f2fd30`):
 

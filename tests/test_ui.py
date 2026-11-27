@@ -7,8 +7,8 @@ import numpy as np
 import pymupdf
 import pytest
 from PIL import Image
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QByteArray, QMimeData, QPointF, Qt, QUrl
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QImage
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QPushButton
 
 from cardprint.export import OriginalGuard
@@ -23,7 +23,14 @@ from cardprint.ui.theme import (
     THEME_LIGHT,
     build_stylesheet,
 )
-from cardprint.ui.window import BASE_WINDOW_TITLE, InspectorDialog, MainWindow
+from cardprint.ui.window import (
+    BASE_WINDOW_TITLE,
+    SOURCE_BADGES_ROLE,
+    SOURCE_DRAG_MIME,
+    SOURCE_ID_ROLE,
+    InspectorDialog,
+    MainWindow,
+)
 
 REAL_PROMPT_UNSAVED = MainWindow._prompt_unsaved_changes
 
@@ -192,7 +199,7 @@ def test_full_gui_import_assign_edit_preview_export_and_original_guard(
     # Even removed thumbnails and cleared sides cannot make originals export targets.
     window.sources.setCurrentRow(0)
     window.remove_source()
-    window.side_combo.setCurrentIndex(0)
+    window.select_side("front")
     front_pixels = window.cards["front"].original
     window.remove_side()
     wait_ready(qtbot, window)
@@ -1354,5 +1361,223 @@ def test_button_variants_contextual_panels_accessibility_and_compact_layout(
     sizes = window.splitter.sizes()
     assert len(sizes) == 3 and all(pane > 180 for pane in sizes)
     assert sum(sizes) <= 1280
+
+    window.close()
+
+
+def _dispatch_drop(widget, mime: QMimeData) -> tuple[QDragEnterEvent, QDropEvent]:
+    enter = QDragEnterEvent(
+        QPointF(12, 12),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.dragEnterEvent(enter)
+    drop = QDropEvent(
+        QPointF(12, 12),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.dropEvent(drop)
+    return enter, drop
+
+
+def test_drag_drop_files_mixed_and_remote_urls_on_window_and_source_list(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    img1 = tmp_path / "one.png"
+    img2 = tmp_path / "two.jpg"
+    pdf = tmp_path / "doc.pdf"
+    unsupported = tmp_path / "notes.txt"
+    synthetic_card.save(img1)
+    synthetic_card.save(img2)
+    _make_multipage_pdf(pdf, pages=2)
+    unsupported.write_text("not an image", encoding="utf-8")
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    controller = ManualTaskController(window)
+    errors: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.show()
+
+    # 1. Valid local image drop onto MainWindow imports via import_paths.
+    mime1 = QMimeData()
+    mime1.setUrls([QUrl.fromLocalFile(str(img1))])
+    enter, drop = _dispatch_drop(window, mime1)
+    assert enter.isAccepted() and drop.isAccepted()
+    controller.drain()
+    assert window.sources.count() == 1
+    assert not errors
+
+    # 2. Drop PDF onto SourceListWidget imports PDF pages (using real pdf worker).
+    mime_pdf = QMimeData()
+    mime_pdf.setUrls([QUrl.fromLocalFile(str(pdf))])
+    enter, drop = _dispatch_drop(window.sources, mime_pdf)
+    assert enter.isAccepted() and drop.isAccepted()
+    controller.drain()
+    qtbot.waitUntil(lambda: window.sources.count() == 3 and not window.tasks, timeout=20000)
+
+    # 3. Mixed drop (valid img2 + unsupported .txt + remote https URL) imports img2 only and warns.
+    mime_mixed = QMimeData()
+    mime_mixed.setUrls(
+        [
+            QUrl.fromLocalFile(str(img2)),
+            QUrl.fromLocalFile(str(unsupported)),
+            QUrl("https://example.com/remote.png"),
+        ]
+    )
+    _dispatch_drop(window, mime_mixed)
+    controller.drain()
+    assert window.sources.count() == 4
+    assert len(errors) == 1
+    assert "notes.txt" in errors[-1]
+    assert "remote.png" in errors[-1]
+
+    # 4. Unsupported-only drop imports nothing and warns clearly.
+    mime_bad = QMimeData()
+    mime_bad.setUrls([QUrl.fromLocalFile(str(unsupported))])
+    _dispatch_drop(window.sources, mime_bad)
+    controller.drain()
+    assert window.sources.count() == 4
+    assert len(errors) == 2
+
+    window.close()
+    qtbot.waitUntil(lambda: window._closed, timeout=10000)
+
+
+def test_thumbnail_drag_to_side_slot_badges_clear_and_undo(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    path_a = tmp_path / "a.png"
+    path_b = tmp_path / "b.png"
+    synthetic_card.save(path_a)
+    Image.new("RGB", (400, 260), (20, 120, 70)).save(path_b)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    controller = ManualTaskController(window)
+    errors: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window.show()
+    window.import_paths([path_a, path_b])
+    controller.drain()
+    assert window.sources.count() == 2
+
+    item0 = window.sources.item(0)
+    item1 = window.sources.item(1)
+    id0 = item0.data(SOURCE_ID_ROLE)
+    mime0 = window.sources.mimeData([item0])
+    assert mime0.formats() == [SOURCE_DRAG_MIME]
+    assert bytes(mime0.data(SOURCE_DRAG_MIME)).decode("utf-8") == id0
+    assert str(path_a) not in bytes(mime0.data(SOURCE_DRAG_MIME)).decode("utf-8")
+
+    # Dropping thumbnail onto SourceListWidget itself is rejected.
+    enter_self, drop_self = _dispatch_drop(window.sources, mime0)
+    assert not enter_self.isAccepted() and not drop_self.isAccepted()
+
+    # Forged/unknown source ID is rejected by SideSlotCard.
+    forged = QMimeData()
+    forged.setData(SOURCE_DRAG_MIME, QByteArray(b"forged-external-id"))
+    enter_forged, drop_forged = _dispatch_drop(window.front_slot, forged)
+    assert not enter_forged.isAccepted() and not drop_forged.isAccepted()
+
+    # Valid drops assign Front and Back and render Лиц./Обр. badges.
+    _dispatch_drop(window.front_slot, mime0)
+    controller.drain()
+    mime1 = window.sources.mimeData([item1])
+    _dispatch_drop(window.back_slot, mime1)
+    controller.drain()
+
+    assert window.cards["front"].source.path == path_a.resolve()
+    assert window.cards["back"].source.path == path_b.resolve()
+    assert item0.data(SOURCE_BADGES_ROLE) == ("front",)
+    assert item1.data(SOURCE_BADGES_ROLE) == ("back",)
+    assert not item0.icon().isNull()
+
+    # Clicking × on back_slot removes Back, clears Обр. badge, and Undo restores it.
+    qtbot.mouseClick(window.back_slot.clear_button, Qt.MouseButton.LeftButton)
+    controller.drain()
+    assert "back" not in window.cards
+    assert window.back_slot.status_pill.text() == "Не назначена"
+    assert item1.data(SOURCE_BADGES_ROLE) == ()
+
+    window.undo()
+    controller.drain()
+    assert window.cards["back"].source.path == path_b.resolve()
+    assert item1.data(SOURCE_BADGES_ROLE) == ("back",)
+
+    # Failed replacement via drag-and-drop (source mutated on disk) preserves prior Front card.
+    prev_front = window.cards["front"]
+    Image.new("RGB", (300, 200), (180, 30, 30)).save(path_b)
+    _dispatch_drop(window.front_slot, mime1)
+    controller.drain()
+    assert errors and "изменился" in errors[-1]
+    assert window.cards["front"] is prev_front
+    assert item0.data(SOURCE_BADGES_ROLE) == ("front",)
+
+    window.close()
+
+
+def test_side_slot_statuses_auto_review_distinction_and_late_load_focus_guard(
+    qtbot, tmp_path, synthetic_card
+):
+    path_a = tmp_path / "a.png"
+    path_b = tmp_path / "b.png"
+    synthetic_card.save(path_a)
+    synthetic_card.save(path_b)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    controller = ManualTaskController(window)
+    window.show()
+    window.import_paths([path_a, path_b])
+    controller.drain()
+
+    assert window.front_slot.status_pill.text() == "Не назначена"
+    assert window.back_slot.status_pill.text() == "Не назначена"
+    assert window.front_slot.status_pill.property("status") == "muted"
+
+    # Start loading Front -> status pill enters Загрузка…; user immediately switches to Back slot.
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    assert window.front_slot.status_pill.text() == "⟳ Загрузка…"
+    assert window.front_slot.status_pill.property("status") == "info"
+
+    qtbot.mouseClick(window.back_slot, Qt.MouseButton.LeftButton)
+    assert window.active_side == "back"
+    assert window.back_slot.property("active") == "true"
+
+    # When Front finishes late, active_side must stay Back (user's newer choice preserved).
+    controller.drain()
+    assert "front" in window.cards
+    assert window.active_side == "back"
+
+    # Keyboard Space activates front_slot without relying on mouse/drag-drop.
+    window.front_slot.setFocus()
+    qtbot.keyClick(window.front_slot, Qt.Key.Key_Space)
+    assert window.active_side == "front"
+
+    # Auto-detected contour distinguishes review warning from confirmed Готово, while export is ready.
+    assert window.front_slot.status_pill.text() == "⚠ Проверьте границы"
+    assert window.front_slot.status_pill.property("status") == "warning"
+    assert window.sheet is not None and window.pdf_button.isEnabled()
+    assert "Проверьте" in window.layout_message.text()
+
+    # Manual corner commit marks Front as Готово and removes review notice.
+    window.selection_changed(((15, 15), (830, 15), (830, 520), (15, 520)))
+    controller.drain()
+    assert window.front_slot.status_pill.text() == "✓ Готово"
+    assert window.front_slot.status_pill.property("status") == "ok"
+    assert "Проверьте" not in window.layout_message.text()
+
+    # Invalid corner selection updates slot status pill to Ошибка выделения.
+    window.selection_changed(((10, 10), (800, 500), (800, 10), (10, 500)))
+    controller.drain()
+    assert window.front_slot.status_pill.text() == "✕ Ошибка выделения"
+    assert window.front_slot.status_pill.property("status") == "error"
 
     window.close()

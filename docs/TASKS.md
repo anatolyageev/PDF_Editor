@@ -155,7 +155,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-03`: Add drag-and-drop import, visual Front/Back slot cards, and source badges
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-02`
 - **Goal:** Make document loading and side assignment effortless via drag-and-drop, visual side slot cards with live status, and assignment badges on source thumbnails.
 - **Target files:**
@@ -170,9 +170,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - Keep existing test accessors/behavior compatible or update `tests/test_ui.py` cleanly for the slot widgets.
   - Keep labelled assignment/import buttons as keyboard alternatives. Accept local URLs only; validate mixed drops per file and use internal source IDs for thumbnail drags.
   - Replacement is undoable; cancel/failure preserves the prior card. A late load cannot change the user's newer active-side choice. Clearly distinguish automatic-contour review from readiness to export.
-- **Verification:**
-  - `uv run pytest -q tests/test_ui.py`
-  - `uv run pytest -q && uv run ruff check src tests scripts && uv run ruff format --check src tests scripts`
+- **Verification:** `uv run pytest -q tests/test_ui.py` (26 passed, `offscreen`), `uv run pytest -q` (76 passed, `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (22 files formatted).
 
 ---
 

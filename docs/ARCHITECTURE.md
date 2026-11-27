@@ -27,7 +27,7 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [ui/theme.py](../src/cardprint/ui/theme.py) | `ThemePalette` (`light` / `dark`), `QPalette` + QSS stylesheet generation (`variant` button hierarchy, semantic `status` labels, card-style panels), and `QSettings` persistence. |
 | [ui/icons.py](../src/cardprint/ui/icons.py) | Bundled inline monochrome SVG icons rendered and palette-tinted via `QSvgRenderer` at `1×` / `2×` DPI with bounded LRU caching. |
 | [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, theme-aware canvas/accent colors, zoom, and pan. |
-| [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, side assignments, contextual right panels, theme toggle, task coordination, and export actions. |
+| [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, `SourceListWidget`, `SideSlotCard` slots with `Лиц.` / `Обр.` badges, drag-and-drop file/thumbnail import, contextual right panels, theme toggle, task coordination, and export actions. |
 | [ui/tasks.py](../src/cardprint/ui/tasks.py) | `QRunnable` `Task` for pure image work and `PdfTaskBridge` for delivering `PdfWorkerClient` results onto the GUI thread. |
 | [tests/](../tests/) | Geometry, model, worker, processing, export, and Qt integration tests using artificial data. |
 | [scripts/](../scripts/) | Example generation and a GUI smoke test that saves screenshots and exports. |
@@ -140,6 +140,8 @@ Several independent counters, caches, and state fields protect result freshness 
 - `_reload_generation` and `_save_generation`: ensure superseded source reloads do
   not overwrite newer side assignments or in-flight side loads, and obsolete
   pre-dialog export validations cannot open stale save dialogs.
+- `_side_selection_seq`: prevents a late background side load from switching `active_side`
+  after the user has explicitly selected another `SideSlotCard`.
 
 `invalidate_sheet` clears the ready `Sheet` and disables export. Export becomes
 available only after current processing and successful `arrange` validation.

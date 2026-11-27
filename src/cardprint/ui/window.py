@@ -1,8 +1,28 @@
+import secrets
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QSettings, QSize, Qt, QThreadPool, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import (
+    QByteArray,
+    QMimeData,
+    QSettings,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -12,6 +32,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -23,6 +44,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -77,6 +99,266 @@ from .theme import (
 )
 
 BASE_WINDOW_TITLE = "Карточки на A4 · локальная подготовка к печати"
+SUPPORTED_IMPORT_EXTENSIONS = frozenset({".pdf", ".jpg", ".jpeg", ".png"})
+SOURCE_DRAG_MIME = "application/x-cardprint-source-id"
+SOURCE_ID_ROLE = Qt.ItemDataRole.UserRole + 1
+SOURCE_BADGES_ROLE = Qt.ItemDataRole.UserRole + 2
+SIDE_BADGE_LABELS = {"front": "Лиц.", "back": "Обр."}
+
+
+def partition_dropped_urls(urls: list[QUrl]) -> tuple[list[Path], list[str]]:
+    """Split dropped URLs into supported existing local files and rejected items."""
+    valid_paths: list[Path] = []
+    rejected: list[str] = []
+    for url in urls:
+        if not url.isLocalFile():
+            rejected.append(url.toString() or "внешняя ссылка")
+            continue
+        path = Path(url.toLocalFile())
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMPORT_EXTENSIONS:
+            rejected.append(path.name or str(path))
+            continue
+        valid_paths.append(path)
+    return valid_paths, rejected
+
+
+def render_source_item_icon(
+    source: Source, badges: tuple[str, ...], palette: ThemePalette
+) -> QIcon:
+    """Render source thumbnail into a fixed icon tile with optional Front/Back badges."""
+    tile_w, tile_h = 144, 108
+    canvas = QPixmap(tile_w, tile_h)
+    canvas.fill(Qt.GlobalColor.transparent)
+    thumb_pm = pixmap(source.thumbnail)
+    scaled = thumb_pm.scaled(
+        tile_w,
+        tile_h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    x = (tile_w - scaled.width()) // 2
+    y = (tile_h - scaled.height()) // 2
+    painter.drawPixmap(x, y, scaled)
+
+    if badges:
+        font = QFont(painter.font())
+        font.setPointSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        bx = 4
+        by = 4
+        for side in badges:
+            label = SIDE_BADGE_LABELS.get(side)
+            if not label:
+                continue
+            bg = QColor(palette.accent if side == "front" else palette.success)
+            fg = QColor(
+                palette.accent_text
+                if side == "front"
+                else ("#0f172a" if palette.name == THEME_DARK else "#ffffff")
+            )
+            text_w = metrics.horizontalAdvance(label)
+            pill_w = text_w + 12
+            pill_h = metrics.height() + 4
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(bx, by, pill_w, pill_h, 6, 6)
+            painter.setPen(fg)
+            painter.drawText(bx, by, pill_w, pill_h, Qt.AlignmentFlag.AlignCenter, label)
+            bx += pill_w + 4
+    painter.end()
+    return QIcon(canvas)
+
+
+class SourceListWidget(QListWidget):
+    """Source thumbnail list accepting local file drops and dragging internal source IDs."""
+
+    def __init__(self, on_urls_dropped=None, parent=None):
+        super().__init__(parent)
+        self._on_urls_dropped = on_urls_dropped
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+
+    def mimeTypes(self) -> list[str]:
+        return [SOURCE_DRAG_MIME]
+
+    def supportedDropActions(self) -> Qt.DropActions:
+        return Qt.DropAction.CopyAction
+
+    def mimeData(self, items) -> QMimeData:
+        mime = QMimeData()
+        for item in items:
+            source_id = item.data(SOURCE_ID_ROLE)
+            if isinstance(source_id, str) and source_id:
+                mime.setData(SOURCE_DRAG_MIME, QByteArray(source_id.encode("utf-8")))
+                break
+        return mime
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            if self._on_urls_dropped is not None:
+                self._on_urls_dropped(list(event.mimeData().urls()))
+            return
+        event.ignore()
+
+
+class SideSlotCard(QFrame):
+    """Clickable, droppable visual slot card for the Front or Back document side."""
+
+    selected = Signal(str)
+    clearRequested = Signal(str)
+    sourceDropped = Signal(str, str)
+    urlsDropped = Signal(object)
+
+    def __init__(self, side: str, *, can_accept_source_id=None, parent=None):
+        super().__init__(parent)
+        self.side = side
+        self._can_accept_source_id = can_accept_source_id
+        self.setObjectName(f"side_slot_{side}")
+        self.setAccessibleName(f"Слот стороны: {SIDE_NAMES[side]}")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAcceptDrops(True)
+        set_widget_property(self, "slot", "side")
+        set_widget_property(self, "active", "false")
+        set_widget_property(self, "dragOver", "false")
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(6, 4, 6, 4)
+        root.setSpacing(8)
+
+        self.preview_label = QLabel("Перетащите\nфайл")
+        self.preview_label.setFixedSize(64, 44)
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setWordWrap(True)
+        set_widget_property(self.preview_label, "role", "slotPreview")
+        root.addWidget(self.preview_label)
+
+        info = QVBoxLayout()
+        info.setSpacing(3)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+        self.title_label = QLabel(SIDE_NAMES[side])
+        set_widget_property(self.title_label, "role", "sectionTitle")
+        top_row.addWidget(self.title_label)
+        self.status_pill = QLabel("Не назначена")
+        self.status_pill.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        set_widget_property(self.status_pill, "pill", "status")
+        set_widget_property(self.status_pill, "status", "muted")
+        top_row.addWidget(self.status_pill)
+        top_row.addStretch()
+        info.addLayout(top_row)
+
+        self.source_name_label = QLabel("Не выбрано")
+        set_widget_property(self.source_name_label, "status", "muted")
+        info.addWidget(self.source_name_label)
+        root.addLayout(info, 1)
+
+        self.clear_button = QPushButton("×")
+        set_widget_property(self.clear_button, "variant", "slotClear")
+        self.clear_button.setAccessibleName(f"Убрать сторону: {SIDE_NAMES[side]}")
+        self.clear_button.setToolTip(f"Очистить {SIDE_NAMES[side].lower()}")
+        self.clear_button.clicked.connect(lambda: self.clearRequested.emit(self.side))
+        root.addWidget(self.clear_button, 0, Qt.AlignmentFlag.AlignTop)
+
+    def update_state(
+        self,
+        *,
+        active: bool,
+        source_label: str,
+        status_text: str,
+        status_kind: str,
+        tooltip: str,
+        preview_pixmap: QPixmap | None,
+        can_clear: bool,
+    ) -> None:
+        set_widget_property(self, "active", "true" if active else "false")
+        self.source_name_label.setText(source_label)
+        self.source_name_label.setToolTip(tooltip or source_label)
+        self.status_pill.setText(status_text)
+        set_widget_property(self.status_pill, "status", status_kind)
+        if preview_pixmap is not None and not preview_pixmap.isNull():
+            self.preview_label.setText("")
+            self.preview_label.setPixmap(preview_pixmap)
+        else:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Перетащите\nфайл")
+        self.clear_button.setEnabled(can_clear)
+        self.setToolTip(tooltip or f"Выбрать для редактирования: {SIDE_NAMES[self.side]}")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self.side)
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.selected.emit(self.side)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _source_id_from_mime(self, mime: QMimeData) -> str | None:
+        if not mime.hasFormat(SOURCE_DRAG_MIME):
+            return None
+        source_id = bytes(mime.data(SOURCE_DRAG_MIME)).decode("utf-8", errors="ignore").strip()
+        if not source_id:
+            return None
+        if self._can_accept_source_id is not None and not self._can_accept_source_id(source_id):
+            return None
+        return source_id
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if self._source_id_from_mime(mime) is not None or mime.hasUrls():
+            set_widget_property(self, "dragOver", "true")
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        mime = event.mimeData()
+        if self._source_id_from_mime(mime) is not None or mime.hasUrls():
+            set_widget_property(self, "dragOver", "true")
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        set_widget_property(self, "dragOver", "false")
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        set_widget_property(self, "dragOver", "false")
+        mime = event.mimeData()
+        source_id = self._source_id_from_mime(mime)
+        if source_id is not None:
+            event.acceptProposedAction()
+            self.sourceDropped.emit(self.side, source_id)
+            return
+        if mime.hasUrls():
+            event.acceptProposedAction()
+            self.urlsDropped.emit(list(mime.urls()))
+            return
+        event.ignore()
 
 
 class InspectorDialog(QDialog):
@@ -167,6 +449,7 @@ class MainWindow(QMainWindow):
         self.theme_palette: ThemePalette = get_palette(self.theme_name)
         self._themed_buttons: list[tuple[QPushButton, str, str]] = []
         self.setWindowTitle(BASE_WINDOW_TITLE)
+        self.setAcceptDrops(True)
         self.setMinimumSize(960, 620)
         self.resize(1360, 860)
         self.cards: dict[str, Card] = {}
@@ -178,6 +461,11 @@ class MainWindow(QMainWindow):
         self._save_generation = 0
         self.session_id = 1
         self._card_revision_seq = 0
+        self._drag_session_token = secrets.token_hex(8)
+        self._source_id_seq = 0
+        self._source_registry: dict[str, Source] = {}
+        self._side_selection_seq = 0
+        self._needs_contour_review: set[str] = set()
         self.history = UndoStack(WorkspaceSnapshot((), Layout()))
         self.checkpoints = WorkspaceCheckpoints(self.history.current)
         self.load_generation = {"front": 0, "back": 0}
@@ -209,6 +497,7 @@ class MainWindow(QMainWindow):
         )
         self.apply_theme(self.theme_name, persist=False)
         self._sync_controls()
+        self._sync_side_slots()
         self._sync_context_panels()
         self._sync_history_controls()
         self._sync_dirty_ui()
@@ -297,7 +586,7 @@ class MainWindow(QMainWindow):
         left_title = QLabel("Файлы и страницы PDF")
         set_widget_property(left_title, "role", "sectionTitle")
         left_layout.addWidget(left_title)
-        self.sources = QListWidget()
+        self.sources = SourceListWidget(on_urls_dropped=self.handle_dropped_urls)
         self.sources.setAccessibleName("Список загруженных файлов и страниц PDF")
         self.sources.setIconSize(QSize(144, 108))
         self.sources.setViewMode(QListView.ViewMode.IconMode)
@@ -308,7 +597,7 @@ class MainWindow(QMainWindow):
         self.sources.itemDoubleClicked.connect(self.assign_next)
         left_layout.addWidget(self.sources)
         label = QLabel(
-            "Выберите миниатюру и назначьте сторону.\nДвойной щелчок заполняет следующую сторону."
+            "Перетащите файл или миниатюру на слот стороны, либо выберите миниатюру и нажмите кнопку."
         )
         label.setWordWrap(True)
         set_widget_property(label, "status", "muted")
@@ -355,21 +644,23 @@ class MainWindow(QMainWindow):
         edit_tab = QWidget()
         edit_layout = QVBoxLayout(edit_tab)
         side_row = QHBoxLayout()
-        self.side_combo = QComboBox()
-        self.side_combo.setAccessibleName("Выбор редактируемой стороны")
-        for side, name in SIDE_NAMES.items():
-            self.side_combo.addItem(name, side)
-        self.side_combo.currentIndexChanged.connect(self.change_side)
-        side_row.addWidget(self.side_combo, 1)
-        side_row.addWidget(
-            self._button(
-                "Убрать сторону",
-                self.remove_side,
-                variant="danger",
-                icon_name="remove",
-                tooltip="Очистить назначение текущей стороны",
-            )
+        side_row.setSpacing(8)
+        self.front_slot = SideSlotCard(
+            "front", can_accept_source_id=lambda sid: sid in self._source_registry
         )
+        self.back_slot = SideSlotCard(
+            "back", can_accept_source_id=lambda sid: sid in self._source_registry
+        )
+        self.side_slots: dict[str, SideSlotCard] = {
+            "front": self.front_slot,
+            "back": self.back_slot,
+        }
+        for slot in (self.front_slot, self.back_slot):
+            slot.selected.connect(self.select_side)
+            slot.clearRequested.connect(self.remove_side)
+            slot.sourceDropped.connect(self.assign_source_by_id)
+            slot.urlsDropped.connect(self.handle_dropped_urls)
+            side_row.addWidget(slot, 1)
         edit_layout.addLayout(side_row)
         self.source_label = QLabel("Сторона не назначена")
         self.source_label.setWordWrap(True)
@@ -658,6 +949,10 @@ class MainWindow(QMainWindow):
             self.theme_button.setAccessibleName("Переключить на тёмную тему")
             self.theme_button.setToolTip("Переключить на тёмную тему оформления")
         self._refresh_theme_icons()
+        if hasattr(self, "sources"):
+            self._refresh_source_badges()
+        if hasattr(self, "side_slots"):
+            self._sync_side_slots()
         if persist:
             save_theme(palette.name, self._settings)
         return palette
@@ -665,6 +960,107 @@ class MainWindow(QMainWindow):
     def toggle_theme(self) -> str:
         next_theme = THEME_LIGHT if self.theme_name == THEME_DARK else THEME_DARK
         return self.apply_theme(next_theme, persist=True).name
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self.handle_dropped_urls(list(event.mimeData().urls()))
+            return
+        super().dropEvent(event)
+
+    def handle_dropped_urls(self, urls: list[QUrl]) -> None:
+        if self._closing or self._closed:
+            return
+        valid_paths, rejected = partition_dropped_urls(urls)
+        if valid_paths:
+            self.import_paths(valid_paths)
+        if rejected:
+            sample = ", ".join(rejected[:3])
+            suffix = f" и ещё {len(rejected) - 3}" if len(rejected) > 3 else ""
+            message = (
+                f"Не удалось добавить перетащенные элементы ({sample}{suffix}): "
+                "поддерживаются только локальные файлы PDF, JPG, JPEG и PNG."
+            )
+            self.statusBar().showMessage(message)
+            self.show_error(message)
+
+    def _assigned_badges_by_key(self) -> dict[tuple[Path, int | None], tuple[str, ...]]:
+        sides_by_key: dict[tuple[Path, int | None], list[str]] = {}
+        for side in ("front", "back"):
+            card = self.cards.get(side)
+            if card is None:
+                continue
+            key = (card.source.path.resolve(), card.source.page)
+            sides_by_key.setdefault(key, []).append(side)
+        return {key: tuple(sides) for key, sides in sides_by_key.items()}
+
+    def _refresh_source_badges(self) -> None:
+        assigned = self._assigned_badges_by_key()
+        for i in range(self.sources.count()):
+            item = self.sources.item(i)
+            source: Source = item.data(Qt.ItemDataRole.UserRole)
+            key = (source.path.resolve(), source.page)
+            badges = assigned.get(key, ())
+            item.setData(SOURCE_BADGES_ROLE, badges)
+            item.setIcon(render_source_item_icon(source, badges, self.theme_palette))
+
+    def _sync_side_slots(self) -> None:
+        for side, slot in self.side_slots.items():
+            active = self.active_side == side
+            card = self.cards.get(side)
+            loading = side in self.pending_loads
+            preview_pm: QPixmap | None = None
+            source_text = "Не выбрано"
+            tooltip = ""
+            if card is not None:
+                source_text = card.source.label
+                tooltip = str(card.source.path)
+                thumb_src = card.display if card.display is not None else card.source.thumbnail
+                preview_pm = pixmap(thumb_src).scaled(
+                    60,
+                    40,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            elif loading:
+                source_text = "Загрузка выбранного файла…"
+
+            if loading:
+                status_text, status_kind = "⟳ Загрузка…", "info"
+            elif card is None:
+                status_text, status_kind = "Не назначена", "muted"
+            elif card.error:
+                status_text, status_kind = "✕ Ошибка выделения", "error"
+            elif self.is_drafting() and self.draft_side == side:
+                status_text, status_kind = "✎ Выделение…", "warning"
+            elif card.ready_revision != card.revision:
+                status_text, status_kind = "⟳ Обработка…", "info"
+            elif side in self._needs_contour_review:
+                status_text, status_kind = "⚠ Проверьте границы", "warning"
+            else:
+                status_text, status_kind = "✓ Готово", "ok"
+
+            slot.update_state(
+                active=active,
+                source_label=source_text,
+                status_text=status_text,
+                status_kind=status_kind,
+                tooltip=tooltip,
+                preview_pixmap=preview_pm,
+                can_clear=(card is not None or loading),
+            )
 
     def submit(self, function, success, error=None):
         if self._closing or self._closed:
@@ -738,12 +1134,22 @@ class MainWindow(QMainWindow):
             )
             for i in range(self.sources.count())
         }
+        assigned = self._assigned_badges_by_key()
         added = 0
         for source in sources:
             if (source.path, source.page) in existing:
                 continue
-            item = QListWidgetItem(QIcon(pixmap(source.thumbnail)), source.label)
+            self._source_id_seq += 1
+            source_id = f"{self._drag_session_token}:{self._source_id_seq}"
+            self._source_registry[source_id] = source
+            key = (source.path.resolve(), source.page)
+            badges = assigned.get(key, ())
+            item = QListWidgetItem(
+                render_source_item_icon(source, badges, self.theme_palette), source.label
+            )
             item.setData(Qt.ItemDataRole.UserRole, source)
+            item.setData(SOURCE_ID_ROLE, source_id)
+            item.setData(SOURCE_BADGES_ROLE, badges)
             item.setSizeHint(QSize(190, 150))
             item.setToolTip(str(source.path))
             self.sources.addItem(item)
@@ -865,7 +1271,10 @@ class MainWindow(QMainWindow):
                             self.sources.item(i).data(Qt.ItemDataRole.UserRole).path.resolve()
                             == resolved_pdf
                         ):
-                            self.sources.takeItem(i)
+                            taken = self.sources.takeItem(i)
+                            source_id = taken.data(SOURCE_ID_ROLE) if taken is not None else None
+                            if isinstance(source_id, str):
+                                self._source_registry.pop(source_id, None)
                 self.original_paths.add(Path(info.path))
                 self.original_guard.register(info.path)
                 request_batch(0)
@@ -926,7 +1335,13 @@ class MainWindow(QMainWindow):
                     row_src = row_item.data(Qt.ItemDataRole.UserRole)
                     if row_src.path.resolve() == target_path and row_src.page is None:
                         row_item.setData(Qt.ItemDataRole.UserRole, new_source)
-                        row_item.setIcon(QIcon(pixmap(new_source.thumbnail)))
+                        row_id = row_item.data(SOURCE_ID_ROLE)
+                        if isinstance(row_id, str):
+                            self._source_registry[row_id] = new_source
+                        badges = tuple(row_item.data(SOURCE_BADGES_ROLE) or ())
+                        row_item.setIcon(
+                            render_source_item_icon(new_source, badges, self.theme_palette)
+                        )
                 for side, expected_card, _, expected_load_gen in affected_sides:
                     if side_still_matches(side, expected_card, expected_load_gen):
                         self._load_source_for_side(side, new_source)
@@ -972,37 +1387,55 @@ class MainWindow(QMainWindow):
         source = item.data(Qt.ItemDataRole.UserRole)
         self._load_source_for_side(side, source)
 
+    def assign_source_by_id(self, side: str, source_id: str) -> bool:
+        if self._closing or self._closed or side not in SIDE_NAMES:
+            return False
+        source = self._source_registry.get(source_id)
+        if source is None:
+            return False
+        self._load_source_for_side(side, source)
+        return True
+
     def _load_source_for_side(self, side: str, source: Source):
-        self._clear_draft()
+        if self.draft_side == side:
+            self._clear_draft()
         self.load_generation[side] += 1
         token = self.load_generation[side]
+        selection_seq_at_start = self._side_selection_seq
         self.pending_loads.add(side)
         self.refresh_inspectors()
+        self._sync_side_slots()
         self.invalidate_sheet("Загрузка выбранной стороны…")
 
         def finish_load(result):
             if self._closing or self._closed or token != self.load_generation[side]:
                 return
             self.pending_loads.discard(side)
-            self._clear_draft()
+            if self.draft_side == side:
+                self._clear_draft()
             original, points, display, found = result
             card = Card(source, original, points, display=display)
             self.cards[side] = card
+            self._needs_contour_review.add(side)
             self.refresh_inspectors()
-            self.side_combo.setCurrentIndex(0 if side == "front" else 1)
-            self.active_side = side
+            if self._side_selection_seq == selection_seq_at_start:
+                self.active_side = side
             self.statusBar().showMessage(
-                "Проверьте автоматически найденные углы."
+                "Контур найден автоматически — проверьте углы перед экспортом."
                 if found
                 else "Контур не найден. Укажите четыре угла вручную или перетащите точки."
             )
             self._record_history(f"Назначение: {SIDE_NAMES[side]}")
-            self.show_card()
+            if self.active_side == side:
+                self.show_card()
+            self._sync_side_slots()
+            self._refresh_source_badges()
             self.render_card(side)
 
         def fail_load(message):
             if not (self._closing or self._closed) and token == self.load_generation[side]:
                 self.pending_loads.discard(side)
+                self._sync_side_slots()
                 self.show_error(message)
                 self.layout_changed()
 
@@ -1069,28 +1502,44 @@ class MainWindow(QMainWindow):
     def remove_source(self):
         row = self.sources.currentRow()
         if row >= 0:
-            self.sources.takeItem(row)
+            taken = self.sources.takeItem(row)
+            source_id = taken.data(SOURCE_ID_ROLE) if taken is not None else None
+            if isinstance(source_id, str):
+                self._source_registry.pop(source_id, None)
             self.statusBar().showMessage(
                 "Миниатюра убрана. Назначенные стороны и исходный файл сохранены."
             )
 
-    def remove_side(self):
-        if self.draft_side == self.active_side:
+    def remove_side(self, side: str | None = None):
+        target_side = self.active_side if side is None else side
+        if target_side not in SIDE_NAMES:
+            return
+        if self.draft_side == target_side:
             self._clear_draft()
-        self.load_generation[self.active_side] += 1
-        self.pending_loads.discard(self.active_side)
-        self.pdf_worker.cancel_key(("load_side", self.active_side))
-        removed = self.cards.pop(self.active_side, None)
+        self.load_generation[target_side] += 1
+        self.pending_loads.discard(target_side)
+        self._needs_contour_review.discard(target_side)
+        self.pdf_worker.cancel_key(("load_side", target_side))
+        removed = self.cards.pop(target_side, None)
         if removed is not None:
-            self._record_history(f"Удаление: {SIDE_NAMES[self.active_side]}")
+            self._record_history(f"Удаление: {SIDE_NAMES[target_side]}")
         self.refresh_inspectors()
-        self.show_card()
+        if target_side == self.active_side:
+            self.show_card()
+        self._sync_side_slots()
+        self._refresh_source_badges()
         self.layout_changed()
 
-    def change_side(self):
-        had_draft = self._clear_draft()
-        self.active_side = self.side_combo.currentData()
-        self.show_card()
+    def select_side(self, side: str):
+        if side not in SIDE_NAMES:
+            return
+        self._side_selection_seq += 1
+        had_draft = False
+        if self.active_side != side:
+            had_draft = self._clear_draft()
+            self.active_side = side
+            self.show_card()
+        self._sync_side_slots()
         if had_draft:
             self.refresh_sheet()
 
@@ -1123,6 +1572,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
         self.statusBar().showMessage(message)
         self._sync_controls()
+        self._sync_side_slots()
 
     def on_draft_cancelled(self):
         self.draft_message = None
@@ -1130,6 +1580,7 @@ class MainWindow(QMainWindow):
         self.layout_timer.stop()
         self.statusBar().showMessage("Выделение отменено. Восстановлены предыдущие углы.")
         self._sync_controls()
+        self._sync_side_slots()
         self.refresh_sheet()
 
     def keyPressEvent(self, event):
@@ -1218,6 +1669,7 @@ class MainWindow(QMainWindow):
             return
         card.points = points
         card.cropped = None
+        self._needs_contour_review.discard(self.active_side)
         self._record_history("Изменение выделения")
         self.render_card(self.active_side)
 
@@ -1233,6 +1685,7 @@ class MainWindow(QMainWindow):
             card.points = full_quad(*card.source_size)
             self.editor.set_points(card.points)
             card.cropped = None
+            self._needs_contour_review.discard(self.active_side)
             self._record_history("Сброс выделения")
             self.render_card(self.active_side)
 
@@ -1265,6 +1718,7 @@ class MainWindow(QMainWindow):
                 return
             card.points = points
             card.cropped = None
+            self._needs_contour_review.add(side)
             if self.active_side == side:
                 self.editor.set_points(points)
             self._record_history("Определение границ")
@@ -1304,6 +1758,7 @@ class MainWindow(QMainWindow):
             card.radius = 0
             card.size = CardSize()
             card.cropped = None
+            self._needs_contour_review.discard(self.active_side)
             self._record_history("Сброс правок стороны")
             self.render_card(self.active_side, update_display=True)
 
@@ -1344,6 +1799,7 @@ class MainWindow(QMainWindow):
         else:
             self.invalidate_sheet()
         self._sync_controls()
+        self._sync_side_slots()
 
         def work():
             if card.revision != revision:
@@ -1377,6 +1833,7 @@ class MainWindow(QMainWindow):
                     self.show_card()
                 else:
                     self._sync_controls()
+            self._sync_side_slots()
             self.layout_changed()
 
         def failed(message):
@@ -1386,6 +1843,7 @@ class MainWindow(QMainWindow):
                 and card.revision == revision
             ):
                 card.error = message
+                self._sync_side_slots()
                 if self.is_drafting():
                     self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
                     self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
@@ -1515,12 +1973,14 @@ class MainWindow(QMainWindow):
             if self.active_side not in self.cards and self.cards:
                 next_side = next(iter(self.cards))
                 self.active_side = next_side
-                self.side_combo.setCurrentIndex(0 if next_side == "front" else 1)
         finally:
             self.syncing = False
 
+        self._needs_contour_review.intersection_update(self.cards.keys())
         self.refresh_inspectors()
         self.show_card()
+        self._sync_side_slots()
+        self._refresh_source_badges()
         self._sync_history_controls()
         self._sync_dirty_ui()
         self.statusBar().showMessage(status_message)
@@ -1595,8 +2055,21 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(1, "Предпросмотр A4")
             set_widget_property(self.layout_message, "status", "ok")
             count = len(sheet.placements)
+            review_sides = [
+                SIDE_NAMES[side]
+                for side in ("front", "back")
+                if side in self.cards and side in self._needs_contour_review
+            ]
+            header = f"✓ Готово к экспорту · На листе: {count} из 2 сторон."
+            if review_sides:
+                header += (
+                    "\n⚠ Проверьте автоматически найденные границы ("
+                    + ", ".join(review_sides)
+                    + ")."
+                )
             self.layout_message.setText(
-                f"✓ На листе: {count} из 2 сторон.\n"
+                header
+                + "\n"
                 + "\n".join(
                     f"{SIDE_NAMES[p.side]}: {p.width_mm:.2f} × {p.height_mm:.2f} мм"
                     for p in sheet.placements

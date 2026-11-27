@@ -192,6 +192,27 @@ QFrame[panel="card"], QGroupBox {{
     margin-top: 12px;
     padding: 12px 10px 10px 10px;
 }}
+QFrame[slot="side"] {{
+    background-color: {p.card_bg};
+    border: 1px solid {p.border};
+    border-radius: 10px;
+    margin-top: 0px;
+    padding: 6px 8px;
+}}
+QFrame[slot="side"]:hover {{
+    background-color: {p.subtle_bg};
+}}
+QFrame[slot="side"][active="true"] {{
+    background-color: {p.card_bg};
+    border: 2px solid {p.accent};
+}}
+QFrame[slot="side"][dragOver="true"] {{
+    background-color: {p.accent_subtle};
+    border: 2px dashed {p.border_focus};
+}}
+QFrame[slot="side"]:focus {{
+    border: 2px solid {p.border_focus};
+}}
 QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
@@ -208,6 +229,64 @@ QLabel {{
 QLabel[role="sectionTitle"] {{
     font-weight: 600;
     color: {p.text_primary};
+}}
+QLabel[role="slotPreview"] {{
+    background-color: {p.panel_bg};
+    border: 1px solid {p.divider};
+    border-radius: 6px;
+    color: {p.text_muted};
+    font-size: 10px;
+}}
+QLabel[pill="status"] {{
+    border-radius: 9px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+QLabel[pill="status"][status="ok"] {{
+    background-color: {p.success_subtle};
+    color: {p.success};
+}}
+QLabel[pill="status"][status="warning"] {{
+    background-color: {p.warning_subtle};
+    color: {p.warning};
+}}
+QLabel[pill="status"][status="error"] {{
+    background-color: {p.danger_subtle};
+    color: {p.danger};
+}}
+QLabel[pill="status"][status="info"] {{
+    background-color: {p.accent_subtle};
+    color: {p.text_primary};
+}}
+QLabel[pill="status"][status="muted"] {{
+    background-color: {p.subtle_bg};
+    color: {p.text_secondary};
+}}
+QPushButton[variant="slotClear"] {{
+    background-color: transparent;
+    color: {p.text_secondary};
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 0px;
+    min-width: 24px;
+    max-width: 24px;
+    min-height: 24px;
+    max-height: 24px;
+    font-weight: 700;
+}}
+QPushButton[variant="slotClear"]:hover {{
+    background-color: {p.danger_subtle};
+    color: {p.danger};
+    border-color: {p.danger};
+}}
+QPushButton[variant="slotClear"]:focus {{
+    border: 2px solid {p.border_focus};
+}}
+QPushButton[variant="slotClear"]:disabled {{
+    background-color: transparent;
+    color: {p.text_muted};
+    border-color: transparent;
 }}
 QLabel[status="muted"] {{
     color: {p.text_secondary};

@@ -51,8 +51,8 @@ def main() -> int:
         elif phase == 2 and window.sheet and len(window.sheet.placements) == 2:
             # Correct the preliminary contour using the known synthetic card corners.
             # This exercises the same selection callback as manual handle adjustment.
-            for index, side in enumerate(("front", "back")):
-                window.side_combo.setCurrentIndex(index)
+            for side in ("front", "back"):
+                window.select_side(side)
                 width, height = window.cards[side].source_size
                 points = tuple(
                     (x * width / 1400, y * height / 1000)
