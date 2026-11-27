@@ -236,11 +236,53 @@ reported against commit `051d9b5` before proceeding to `T-02`:
 - Next ready task in [TASKS.md](TASKS.md): `T-04` (corner editor UX upgrades: mask,
   numbered handles, live error, loupe, shortcuts).
 
+### `T-04` (2026-11-27) — Corner editor precision and shortcuts
+
+- Added an even-odd outside dimming mask, numbered/focusable handles, and live
+  `validate_quad` feedback (red contour plus Russian status text) during dragging.
+  These are Qt overlays only and never enter source arrays or exported sheets.
+- Added a floating 4× loupe with a crosshair, edge padding, and corner avoidance.
+  It borrows a rotated NumPy view of immutable original pixels and copies only a
+  41 × 41 region per update, independently of the reduced display image, zoom,
+  pan, and Qt device scaling. Image replacement releases the previous reference;
+  committing/cancelling a gesture hides the loupe.
+- Focused handles support arrows (1 source pixel) and Shift+arrows (10 pixels),
+  clamped to image bounds. A held key coalesces into one commit on release/focus
+  loss; Escape restores the origin. Existing draft/export guards and one render
+  per committed gesture remain in force.
+- Added window-level `Ctrl+O` / `Ctrl+S` through existing button guards and
+  canvas-only `R` / `0`, Russian tooltips/help, and regression coverage for native
+  text/spinbox editing, native text Undo, cancelled/clamped nudges, all rotations,
+  bounded original sampling, live invalidity, and save-shortcut draft blocking.
+- Reconciled the master table's stale `T-02` / `T-03` statuses with their existing
+  completed task sections. Next ready task: `T-06` (A4 preview upgrades); not started.
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-03` on 2026-11-27**
-(Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows,
-display-backend screenshots, and 125%/150% HiDPI scaling remain separately unverified):
+The following results were obtained **after completing `T-04` on 2026-11-27**
+(Linux, Python **3.14.2**, Qt `offscreen`):
+
+| Check | Result and scope |
+| --- | --- |
+| `uv run pytest -q tests/test_ui.py tests/test_geometry.py` | **53 passed** (`16.46s`). |
+| Final drag/nudge assertions (`-k 'handle_drag_suspends or canvas_nudges'`) | **2 passed** (`0.99s`). |
+| `uv run pytest -q` | **86 passed**, **1 warning** (`20.22s`); see below. |
+| `uv run ruff check src tests scripts` | All checks passed. |
+| `uv run ruff format --check src tests scripts` | 22 files already formatted. |
+| `QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.25 uv run pytest -q tests/test_ui.py -k 'loupe or canvas_nudges or actual_editor_coordinates'` | **6 passed** (`0.49s`). |
+| Same focused scaling command with `QT_SCALE_FACTOR=1.5` | **6 passed** (`0.68s`). |
+| Artificial-image editor screenshot | Mask, numbered handles, crosshair and 4× loupe visually inspected using Qt `offscreen`. |
+
+The full run reported `PytestUnraisableExceptionWarning` with `BufferError: Existing
+exports of data: object cannot be re-sized` while finalizing a `BytesIO` during
+`test_inspector_rejects_stale_success_and_error_across_edit_replace_remove_and_close`.
+An isolated rerun of that test with
+`-W error::pytest.PytestUnraisableExceptionWarning` passed (1 test), without the warning.
+Its cause remains unconfirmed; no warning suppression was added. Native display,
+Windows/macOS, and hardware DPI behavior are not verified by offscreen scaling.
+`gui_smoke.py` was not rerun for `T-04`.
+
+Previous `T-03` verification (2026-11-27):
 
 | Check | Result and scope |
 | --- | --- |

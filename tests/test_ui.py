@@ -363,6 +363,7 @@ def test_handle_drag_suspends_export_escape_cancels_and_release_commits_once(
     # Press begins drag transaction and immediately suspends export.
     qtbot.mousePress(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=start)
     assert window.is_drafting()
+    assert window.editor.loupe.isVisible()
     assert window.sheet is None
     assert not window.pdf_button.isEnabled() and not window.png_button.isEnabled()
     assert not window.inspect_button.isEnabled()
@@ -373,11 +374,13 @@ def test_handle_drag_suspends_export_escape_cancels_and_release_commits_once(
     qtbot.mouseMove(window.editor.viewport(), mid)
     qtbot.mouseMove(window.editor.viewport(), dest)
     assert len(controller.pending) == 0
+    assert window.editor.loupe.source_point == window.editor.points()[0]
 
     # Esc during drag restores handles and triggers sheet preview restore only;
     # late mouseRelease must not enqueue any card render task.
     qtbot.keyClick(window.editor, Qt.Key.Key_Escape)
     assert not window.is_drafting()
+    assert not window.editor.loupe.isVisible()
     assert window.editor.points() == origin
     pending_after_cancel = len(controller.pending)
     assert pending_after_cancel == 1
@@ -411,6 +414,9 @@ def test_handle_drag_suspends_export_escape_cancels_and_release_commits_once(
     bad_dest = window.editor.mapFromScene(QPointF(850, 530))
     qtbot.mousePress(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=bad_start)
     qtbot.mouseMove(window.editor.viewport(), bad_dest)
+    assert window.editor.validation_error
+    assert window.editor.polygon.pen().color() == QColor("#dc2626")
+    assert "✕" in window.statusBar().currentMessage()
     qtbot.mouseRelease(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=bad_dest)
     assert len(controller.pending) == 1
     controller.drain()
@@ -1580,4 +1586,228 @@ def test_side_slot_statuses_auto_review_distinction_and_late_load_focus_guard(
     assert window.front_slot.status_pill.text() == "✕ Ошибка выделения"
     assert window.front_slot.status_pill.property("status") == "error"
 
+    window.close()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        ((20, 20), (180, 120), (180, 20), (20, 120)),  # crossing
+        ((110, 90), (180, 20), (180, 120), (20, 120)),  # concave
+        ((20, 20), (20, 120), (180, 120), (180, 20)),  # reversed
+        ((20, 20), (22, 20), (22, 22), (20, 22)),  # tiny
+    ],
+)
+def test_corner_mask_and_live_invalid_outline(qtbot, invalid):
+    view = ImageView(editable=True)
+    qtbot.addWidget(view)
+    original = np.full((150, 200, 3), 255, dtype=np.uint8)
+    original.flags.writeable = False
+    valid = ((20, 20), (180, 20), (180, 120), (20, 120))
+    view.set_image(Image.fromarray(original), points=valid, original=original)
+    view.show()
+    assert view.mask.path().contains(QPointF(5, 5))
+    assert not view.mask.path().contains(QPointF(100, 70))
+    assert 0 < view.mask.brush().color().alpha() < 255
+    assert all(str(i + 1) in handle.toolTip() for i, handle in enumerate(view.handles))
+    commits = []
+    view.selectionChanged.connect(commits.append)
+    view.begin_handle_drag(0)
+    for handle, point in zip(view.handles, invalid):
+        handle.setPos(QPointF(*point))
+    assert view.validation_error
+    assert view.polygon.pen().color() == QColor("#dc2626")
+    assert not commits
+    # Theme changes must not hide an invalid contour.
+    view.set_accent_color(DARK_PALETTE.accent)
+    assert view.polygon.pen().color() == QColor("#dc2626")
+    view.cancel_draft()
+    assert view.points() == valid and not view.validation_error
+    assert view.polygon.pen().color() == QColor(DARK_PALETTE.accent)
+    assert not view.loupe.isVisible()
+    assert not commits
+    assert np.all(original == 255) and not original.flags.writeable
+
+
+@pytest.mark.parametrize("turns", range(4))
+def test_loupe_uses_bounded_original_region_after_rotation_zoom_pan(qtbot, turns):
+    y, x = np.indices((190, 280))
+    original = np.stack((x % 256, y % 256, (x + y) % 256), axis=2).astype(np.uint8)
+    before = original.copy()
+    original.flags.writeable = False
+    rotated = np.rot90(original, -turns)
+    height, width = rotated.shape[:2]
+    view = ImageView(editable=True)
+    qtbot.addWidget(view)
+    view.resize(700, 500)
+    # Deliberately unrelated display pixels: a display-only loupe would be wrong.
+    view.set_image(
+        Image.new("RGB", (28, 19), "magenta"),
+        (width, height),
+        full_quad(width, height),
+        original=original,
+        turns=turns,
+    )
+    view.show()
+    qtbot.waitExposed(view)
+    assert np.shares_memory(view._original_pixels, original)
+    point = (70.25, 50.75)
+    view.begin_handle_drag(0)
+    view.handles[0].setPos(QPointF(*point))
+    for factor in (1.7, 0.6):
+        view.zoom(factor)
+        view.horizontalScrollBar().setValue(view.horizontalScrollBar().value() + 23)
+        view.verticalScrollBar().setValue(view.verticalScrollBar().value() + 17)
+        view.update_loupe()
+        loupe = view.loupe
+        assert loupe.isVisible()
+        assert loupe.sample.size().width() == loupe.sample.size().height() == 41
+        assert loupe.sample.pixelColor(20, 20).getRgb()[:3] == tuple(rotated[50, 70])
+        assert loupe.crosshair == QPointF(2 + 20.75 * 4, 2 + 21.25 * 4)
+        assert loupe.source_point == point
+        assert view.viewport_to_source(QPointF(*view.source_to_viewport(point))) == pytest.approx(
+            point
+        )
+    # Moving towards the overlay relocates it, rather than covering the handle.
+    cursor = view.loupe.geometry().center()
+    view.loupe.avoid(cursor)
+    assert not view.loupe.geometry().contains(cursor)
+    # At an image edge the fixed-size region is padded, not shifted away from the crosshair.
+    view.handles[0].setPos(QPointF(0, 0))
+    assert view.loupe.sample.pixelColor(20, 20).getRgb()[:3] == tuple(rotated[0, 0])
+    assert view.loupe.sample.pixelColor(0, 0).getRgb()[:3] == (235, 235, 235)
+    view.finish_handle_drag()
+    assert not view.loupe.isVisible()
+    np.testing.assert_array_equal(original, before)
+    view.set_image(Image.new("RGB", (50, 40), "white"))
+    assert view._original_pixels is None and not view.loupe.isVisible()
+
+
+def test_canvas_nudges_coalesce_clamp_cancel_and_leave_text_input_alone(
+    qtbot, tmp_path, synthetic_card
+):
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QLineEdit
+
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    view = window.editor
+    window.selection_changed(((30, 30), (800, 30), (800, 500), (30, 500)))
+    controller.drain()
+    view.set_points(window.cards["front"].points)
+    start = view.mapFromScene(view.handles[0].pos())
+    qtbot.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    controller.drain()
+    assert view.scene().focusItem() is view.handles[0]
+    commits = []
+    view.selectionChanged.connect(commits.append)
+    qtbot.keyPress(view, Qt.Key.Key_Right)
+    for _ in range(3):
+        QApplication.sendEvent(
+            view,
+            QKeyEvent(
+                QEvent.Type.KeyPress, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier, "", True
+            ),
+        )
+        QApplication.sendEvent(
+            view,
+            QKeyEvent(
+                QEvent.Type.KeyRelease, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier, "", True
+            ),
+        )
+    assert view.points()[0] == (34, 30)
+    assert view.is_drafting and not window.pdf_button.isEnabled()
+    assert not controller.pending and not commits
+    qtbot.keyRelease(view, Qt.Key.Key_Right)
+    assert len(controller.pending) == len(commits) == 1
+    controller.drain()
+    window.undo()
+    controller.drain()
+    assert window.cards["front"].points[0] == (30, 30)
+    view.setFocus()
+    view.handles[0].setFocus()
+    qtbot.keyClick(view, Qt.Key.Key_Left, modifier=Qt.KeyboardModifier.ShiftModifier)
+    controller.drain()
+    assert window.cards["front"].points[0] == (20, 30)
+    # Esc during a held arrow restores committed points and adds no selection commit.
+    count = len(commits)
+    qtbot.keyPress(view, Qt.Key.Key_Up)
+    qtbot.keyClick(view, Qt.Key.Key_Escape)
+    qtbot.keyRelease(view, Qt.Key.Key_Up)
+    controller.drain()
+    assert view.points()[0] == (20, 30) and len(commits) == count
+    for _ in range(4):
+        qtbot.keyClick(view, Qt.Key.Key_Left, modifier=Qt.KeyboardModifier.ShiftModifier)
+        controller.drain()
+    assert view.points()[0] == (0, 30)
+    # Opposite edges clamp too, and a clamped no-op creates no selection edit.
+    view.handles[2].setPos(QPointF(855, 539))
+    view.selectionChanged.emit(view.points())
+    controller.drain()
+    view.handles[2].setFocus()
+    count = len(commits)
+    for key in (Qt.Key.Key_Right, Qt.Key.Key_Down):
+        qtbot.keyClick(view, key, modifier=Qt.KeyboardModifier.ShiftModifier)
+        controller.drain()
+    assert view.points()[2] == (855, 539) and len(commits) == count
+    # Native text and numeric controls retain letters, numbers, arrows and native Undo.
+    edit = QLineEdit(window)
+    edit.show()
+    edit.setFocus()
+    turns = window.cards["front"].turns
+    points = view.points()
+    view.zoom(1.4)
+    scale = view.transform().m11()
+    qtbot.keyClicks(edit, "R0")
+    qtbot.keyClick(edit, Qt.Key.Key_Left)
+    assert edit.text() == "R0" and edit.cursorPosition() == 1
+    assert window.cards["front"].turns == turns
+    assert view.points() == points and view.transform().m11() == scale
+    depth = window.history.undo_depth
+    qtbot.keyClick(edit, Qt.Key.Key_Z, modifier=Qt.KeyboardModifier.ControlModifier)
+    assert edit.text() == "" and window.history.undo_depth == depth
+    window.radius.setFocus()
+    qtbot.keyClick(window.radius, Qt.Key.Key_Up)
+    controller.drain()
+    assert window.cards["front"].radius > 0 and view.points() == points
+    view.setFocus()
+    qtbot.keyClick(view, Qt.Key.Key_0)
+    assert view.auto_fit
+    qtbot.keyClick(view, Qt.Key.Key_R)
+    controller.drain()
+    assert window.cards["front"].turns == (turns + 1) % 4
+    np.testing.assert_array_equal(
+        view._original_pixels, np.rot90(window.cards["front"].original, -1)
+    )
+    window.close()
+
+
+def test_open_save_shortcuts_honor_export_draft_guard(qtbot, tmp_path, synthetic_card, monkeypatch):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    opened = []
+    saved = []
+    target = tmp_path / "shortcut.pdf"
+
+    def open_dialog(*args, **kwargs):
+        opened.append(True)
+        return [], ""
+
+    def save_dialog(*args, **kwargs):
+        saved.append(True)
+        return str(target), ""
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileNames", open_dialog)
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", save_dialog)
+    window.editor.setFocus()
+    qtbot.keyClick(window.editor, Qt.Key.Key_O, modifier=Qt.KeyboardModifier.ControlModifier)
+    assert opened == [True]
+    window.pick_points()
+    qtbot.keyClick(window.editor, Qt.Key.Key_S, modifier=Qt.KeyboardModifier.ControlModifier)
+    assert not saved and not controller.pending
+    qtbot.keyClick(window.editor, Qt.Key.Key_Escape)
+    controller.drain()
+    qtbot.keyClick(window.editor, Qt.Key.Key_S, modifier=Qt.KeyboardModifier.ControlModifier)
+    controller.drain()
+    assert saved == [True] and target.exists()
+    assert not window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
     window.close()

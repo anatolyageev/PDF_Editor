@@ -517,7 +517,7 @@ class MainWindow(QMainWindow):
             self.add_files,
             variant="secondary",
             icon_name="add_files",
-            tooltip="Добавить изображения или PDF с этого компьютера",
+            tooltip="Добавить изображения или PDF с этого компьютера (Ctrl+O)",
         )
         toolbar.addWidget(self.add_button)
         self.undo_button = self._button(
@@ -565,11 +565,17 @@ class MainWindow(QMainWindow):
             lambda: self.save("pdf"),
             variant="primary",
             icon_name="save_pdf",
-            tooltip="Сохранить готовый лист A4 в PDF без пересжатия карточек",
+            tooltip="Сохранить готовый лист A4 в PDF без пересжатия карточек (Ctrl+S)",
         )
         toolbar.addWidget(self.png_button)
         toolbar.addWidget(self.pdf_button)
         outer.addLayout(toolbar)
+        self._open_shortcut = QShortcut(
+            QKeySequence("Ctrl+O"), self, activated=lambda: self.add_button.click()
+        )
+        self._save_shortcut = QShortcut(
+            QKeySequence("Ctrl+S"), self, activated=lambda: self.pdf_button.click()
+        )
         self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
         self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
         self._redo_shift_shortcut = QShortcut(
@@ -671,6 +677,8 @@ class MainWindow(QMainWindow):
         self.editor.selectionChanged.connect(self.selection_changed)
         self.editor.draftChanged.connect(self.on_draft_changed)
         self.editor.draftCancelled.connect(self.on_draft_cancelled)
+        self.editor.rotateRequested.connect(self.rotate)
+        self.editor.validationChanged.connect(self.on_selection_validation)
         edit_layout.addWidget(self.editor, 1)
         self.editor_actions = []
         action_specs = (
@@ -687,12 +695,18 @@ class MainWindow(QMainWindow):
             row = QHBoxLayout()
             for title, callback, variant, icon_name in pairs:
                 btn = self._button(title, callback, variant=variant, icon_name=icon_name)
+                if icon_name == "rotate":
+                    btn.setToolTip("Повернуть на 90° (R в редакторе)")
+                elif icon_name == "pick_points":
+                    btn.setToolTip("Выделить 4 точки; Esc — отмена")
                 row.addWidget(btn)
                 self.editor_actions.append(btn)
             edit_layout.addLayout(row)
         edit_layout.addLayout(self.view_toolbar(self.editor))
         hint = QLabel(
-            "Колесо — масштаб; фон — перемещение. Углы: 1 ↖ → 2 ↗ → 3 ↘ → 4 ↙.\nПосле выделения четырёх точек можно перетаскивать каждый угол; Esc отменяет ввод точек."
+            "Углы: 1 ↖ → 2 ↗ → 3 ↘ → 4 ↙. Перетаскивание — лупа 4×.\n"
+            "Выберите угол: стрелки — 1 пкс, Shift — 10. R — поворот; 0 — вписать; "
+            "Esc — отмена. Колесо — масштаб; фон — перемещение."
         )
         hint.setWordWrap(True)
         set_widget_property(hint, "status", "muted")
@@ -889,7 +903,7 @@ class MainWindow(QMainWindow):
                 view.fit_image,
                 variant="ghost",
                 icon_name="fit",
-                tooltip="Вписать изображение целиком в область просмотра",
+                tooltip="Вписать изображение целиком (0 на холсте)",
             )
         )
         row.addWidget(
@@ -1583,6 +1597,10 @@ class MainWindow(QMainWindow):
         self._sync_side_slots()
         self.refresh_sheet()
 
+    def on_selection_validation(self, error: str):
+        if self.editor.is_drafting:
+            self.statusBar().showMessage(f"✕ {error}" if error else self.draft_message or "")
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape and self.editor.is_drafting:
             self.editor.cancel_draft()
@@ -1593,7 +1611,13 @@ class MainWindow(QMainWindow):
     def show_card(self):
         card = self.cards.get(self.active_side)
         if card and card.display:
-            self.editor.set_image(card.display, card.source_size, card.points)
+            self.editor.set_image(
+                card.display,
+                card.source_size,
+                card.points,
+                original=card.original,
+                turns=card.display_turns,
+            )
             self.source_label.setText(card.source.label)
         else:
             self.editor.set_image(Image.new("RGB", (700, 440), self.theme_palette.panel_bg))

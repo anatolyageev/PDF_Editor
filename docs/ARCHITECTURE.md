@@ -1,6 +1,6 @@
 # CardPrint Architecture
 
-This document describes version `0.1.0` as of 2026-11-26.
+This document describes version `0.1.0` as of 2026-11-27.
 Entry points: [README](../README.md), [agent instructions](../AGENTS.md),
 [project status](PROJECT_STATUS.md).
 
@@ -26,7 +26,7 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output, and staged PDF/PNG validation. No Qt dependency. |
 | [ui/theme.py](../src/cardprint/ui/theme.py) | `ThemePalette` (`light` / `dark`), `QPalette` + QSS stylesheet generation (`variant` button hierarchy, semantic `status` labels, card-style panels), and `QSettings` persistence. |
 | [ui/icons.py](../src/cardprint/ui/icons.py) | Bundled inline monochrome SVG icons rendered and palette-tinted via `QSvgRenderer` at `1×` / `2×` DPI with bounded LRU caching. |
-| [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, theme-aware canvas/accent colors, zoom, and pan. |
+| [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection/nudge transactions, outside mask, live validation, numbered handles, bounded original-pixel loupe, canvas shortcuts, theme-aware colors, zoom, and pan. |
 | [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, `SourceListWidget`, `SideSlotCard` slots with `Лиц.` / `Обр.` badges, drag-and-drop file/thumbnail import, contextual right panels, theme toggle, task coordination, and export actions. |
 | [ui/tasks.py](../src/cardprint/ui/tasks.py) | `QRunnable` `Task` for pure image work and `PdfTaskBridge` for delivering `PdfWorkerClient` results onto the GUI thread. |
 | [tests/](../tests/) | Geometry, model, worker, processing, export, and Qt integration tests using artificial data. |
@@ -94,6 +94,30 @@ Size modes: `id1` = 85.60 × 53.98 mm; `aspect` = specified width with the aspec
 ratio of the perspective-corrected result; `custom` = independent width and height.
 Layout templates: `vertical` / `horizontal`. Defaults: 15 mm gap, 10 mm margins,
 centered group. Offsets move the entire group, not each side independently.
+
+## Corner editor overlays and input
+
+`ImageView.set_image(..., original=card.original, turns=card.display_turns)` borrows
+an immutable original array for the loupe. `np.rot90` creates a strided view rather
+than a full rotated copy. Each `original_region(x, y)` request copies at most a
+41 × 41 RGB region, padding outside image bounds; this bounded work stays on the
+GUI thread. No PDF read, full-resolution warp, or reduced-display sampling occurs
+while moving a handle. `set_image` releases the prior array reference.
+
+The `Loupe` viewport child paints at 4 logical pixels per source pixel, with Qt
+handling device scaling. Its crosshair uses the fractional handle coordinate and
+the sampled region origin (integer source coordinates denote pixel centres).
+It chooses another viewport corner when approached, ignores mouse input, and
+hides on commit, cancellation, or image replacement. The even-odd scene mask,
+numbered constant-screen-size handles, and invalid polygon overlay are presentation
+only; none enters `Card`, `Sheet`, history snapshots, or export. Live validation
+uses the same `validate_quad` as rendering and emits only status feedback.
+
+Canvas key events own `R`, `0`, and focused-handle arrows (1 source pixel, or 10
+with Shift); these do not intercept text/spinbox input. A held arrow uses the same
+draft/export guard as a mouse drag and commits once on non-repeat key release or
+focus loss. Escape restores its committed origin. Window-level `Ctrl+O` / `Ctrl+S`
+activate the existing import/export buttons, including their disabled-state guards.
 
 ## Background tasks and result freshness
 

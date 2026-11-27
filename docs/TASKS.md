@@ -47,9 +47,9 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 | `T-01` | M1 · Foundation & UX | Extract domain models from `ui/window.py` into `src/cardprint/model.py` | `DONE` | — |
 | `T-05` | M1 · Foundation & UX | Add parametric Undo/Redo for card, assignment and layout edits | `DONE` | `T-01`, `T-18` |
 | `T-20` | M1 · Foundation & UX | Track dirty workspaces and guard close/replacement against lost edits | `DONE` | `T-05` |
-| `T-02` | M1 · Foundation & UX | Add Light/Dark QSS theme system (`ui/theme.py`) and SVG icon helper (`ui/icons.py`) | `TODO` | `T-01`, `T-20` |
-| `T-03` | M1 · Foundation & UX | Add drag-and-drop import, visual Front/Back slot cards, and source badges | `TODO` | `T-02` |
-| `T-04` | M1 · Foundation & UX | Upgrade corner editor UX (mask, numbered handles, live error, loupe, shortcuts) | `TODO` | `T-02`, `T-18`, `T-19` |
+| `T-02` | M1 · Foundation & UX | Add Light/Dark QSS theme system (`ui/theme.py`) and SVG icon helper (`ui/icons.py`) | `DONE` | `T-01`, `T-20` |
+| `T-03` | M1 · Foundation & UX | Add drag-and-drop import, visual Front/Back slot cards, and source badges | `DONE` | `T-02` |
+| `T-04` | M1 · Foundation & UX | Upgrade corner editor UX (mask, numbered handles, live error, loupe, shortcuts) | `DONE` | `T-02`, `T-18`, `T-19` |
 | `T-06` | M1 · Foundation & UX | Upgrade A4 preview (mm rulers, margin guides, crop marks, drag-to-offset) | `TODO` | `T-02`, `T-05` |
 | `T-07` | M2 · Text on A4 | Add Cyrillic TTF font resolver (`fonts.py`), `TextAnnotation`, and shared text export | `TODO` | `T-01`, `T-19` |
 | `T-08` | M2 · Text on A4 | Add interactive A4 text & watermark editing UI with presets and Undo/Redo | `TODO` | `T-05`, `T-06`, `T-07` |
@@ -176,7 +176,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-04`: Upgrade corner editor UX (mask, numbered handles, live error, loupe, shortcuts)
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-02`, `T-18`, `T-19`
 - **Goal:** Improve corner-selection speed and precision in `ImageView` without altering source pixels or coordinate math.
 - **Target files:**
@@ -192,8 +192,9 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - The loupe samples original rotated pixels through a bounded region request; crosshair/handle coordinates agree after zoom, pan and device scaling. Do not magnify only the reduced editor bitmap.
   - Letter/number/nudge shortcuts are scoped to the canvas and do not intercept text, spinbox or form editing. Preserve `T-18` draft/export guards and commit one edit per gesture, not a full-resolution render per mouse move.
 - **Verification:**
-  - `uv run pytest -q tests/test_ui.py tests/test_geometry.py`
-  - `uv run pytest -q && uv run ruff check src tests scripts && uv run ruff format --check src tests scripts`
+  - `uv run pytest -q tests/test_ui.py tests/test_geometry.py`: **53 passed** (`offscreen`); focused follow-up for the final drag/nudge assertions: **2 passed**.
+  - `uv run pytest -q`: **86 passed**, one `BytesIO` finalization warning (see [PROJECT_STATUS.md](PROJECT_STATUS.md)); Ruff check passed; format check: **22 files already formatted**.
+  - Coordinate/loupe/nudge tests with `QT_SCALE_FACTOR=1.25` and `1.5`: **6 passed each**, Qt `offscreen`. Artificial editor screenshot visually inspected. Native display/Windows scaling remains unverified.
 
 ---
 
