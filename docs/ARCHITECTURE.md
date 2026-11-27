@@ -22,8 +22,8 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, PDF thumbnails, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt dependency. |
 | [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, and arrange. Independent of the UI. |
 | [export.py](../src/cardprint/export.py) | Sheet, render_sheet, PDF/PNG output, and safe file writing. No Qt dependency. |
-| [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, zoom, and pan. |
-| [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, Card state, side assignments, settings, task coordination, and export actions. |
+| [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, zoom, and pan. |
+| [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, Card state, side assignments, settings, task coordination, and export actions. |
 | [ui/tasks.py](../src/cardprint/ui/tasks.py) | QRunnable with success/error/finished signals. |
 | [tests/](../tests/) | Geometry, processing, export, and Qt integration tests using artificial data. |
 | [scripts/](../scripts/) | Example generation and a GUI smoke test that saves screenshots and exports. |
@@ -102,6 +102,14 @@ Several independent counters and state fields protect result freshness:
   a newer assignment or restoring a removed side.
 - `layout_generation`: prevent an outdated sheet preview from restoring old sizes.
   Layout changes are debounced using a 160 ms timer.
+- `ImageView.is_drafting` / `MainWindow.draft_message`: treat four-point entry and
+  handle dragging as draft transactions (`draftChanged` / `draftCancelled`). Starting
+  a draft clears `Sheet` and suspends PDF/PNG export until valid completion commits
+  once or `Esc` restores the prior committed selection.
+- `inspector_request_id`, `is_inspector_fresh`, and `InspectorDialog.mark_stale`:
+  reject stale inspector successes and errors across card edits, side replacement or
+  removal, and window closing (`_closing` / `_closed`); open inspector dialogs
+  immediately mark themselves stale when their card revision or assignment changes.
 
 `invalidate_sheet` clears the ready `Sheet` and disables export. Export becomes
 available only after current processing and successful `arrange` validation.

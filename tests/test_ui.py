@@ -1,12 +1,76 @@
+from dataclasses import dataclass
+
 import numpy as np
 import pytest
 from PIL import Image
 from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
 from cardprint.imaging import full_quad
 from cardprint.ui.editor import ImageView
-from cardprint.ui.window import MainWindow
+from cardprint.ui.window import InspectorDialog, MainWindow
+
+
+@dataclass
+class PendingTask:
+    key: int
+    function: object
+    success: object
+    error: object
+
+
+class ManualTaskController:
+    """Deterministic task queue with controlled completion order (no sleep races)."""
+
+    def __init__(self, window: MainWindow):
+        self.window = window
+        self.pending: list[PendingTask] = []
+        self._next_key = 1
+        window.submit = self.submit
+
+    def submit(self, function, success, error=None):
+        if self.window._closing or self.window._closed:
+            return
+        key = self._next_key
+        self._next_key += 1
+        task = PendingTask(key, function, success, error or self.window.show_error)
+        self.pending.append(task)
+        self.window.tasks[key] = task
+        self.window.progress.show()
+
+    def complete_at(self, index: int = 0):
+        task = self.pending.pop(index)
+        try:
+            result = task.function()
+        except Exception as exc:
+            task.error(str(exc) or "Не удалось выполнить операцию.")
+        else:
+            task.success(result)
+        finally:
+            self.window.task_finished(task.key)
+
+    def fail_at(self, index: int, message: str):
+        task = self.pending.pop(index)
+        try:
+            task.error(message)
+        finally:
+            self.window.task_finished(task.key)
+
+    def succeed_at(self, index: int, result):
+        task = self.pending.pop(index)
+        try:
+            task.success(result)
+        finally:
+            self.window.task_finished(task.key)
+
+    def drain(self):
+        while self.pending or self.window.layout_timer.isActive():
+            while self.pending:
+                self.complete_at(0)
+            if self.window.layout_timer.isActive():
+                self.window.layout_timer.stop()
+                self.window.refresh_sheet()
 
 
 def wait_ready(qtbot, window):
@@ -148,4 +212,303 @@ def test_invalid_selection_recovers_and_four_point_mode_works(qtbot, tmp_path, s
     wait_ready(qtbot, window)
     for actual, expected in zip(window.cards["front"].points, points):
         assert actual == pytest.approx(expected, abs=3)
+    window.close()
+
+
+def _setup_front_with_controller(qtbot, tmp_path, synthetic_card):
+    path = tmp_path / "card.png"
+    synthetic_card.save(path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    controller = ManualTaskController(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window.import_paths([path])
+    controller.drain()
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    controller.drain()
+    assert window.sheet is not None
+    assert window.pdf_button.isEnabled() and window.png_button.isEnabled()
+    return window, controller
+
+
+def test_four_point_draft_suspends_export_and_escape_restores(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    warnings = []
+    dialogs_opened = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[-1]))
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: dialogs_opened.append(True) or ("", ""),
+    )
+
+    committed = window.cards["front"].points
+    window.pick_points()
+    assert window.sheet is None
+    assert not window.pdf_button.isEnabled()
+    assert not window.png_button.isEnabled()
+    assert "угол 1 из 4" in window.layout_message.text()
+
+    # Exporting during a draft selection must be blocked before opening a file dialog.
+    window.save("pdf")
+    assert warnings and not dialogs_opened and not controller.pending
+
+    partial = ((15, 15), (830, 15))
+    for idx, pt in enumerate(partial, start=2):
+        viewport = window.editor.mapFromScene(QPointF(*pt))
+        qtbot.mouseClick(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=viewport)
+        assert f"угол {idx} из 4" in window.layout_message.text()
+    assert not controller.pending
+
+    # Unrelated layout changes during a draft must keep export suspended.
+    window.gap.setValue(20)
+    window.refresh_sheet()
+    assert window.sheet is None and not window.pdf_button.isEnabled()
+    assert "угол 3 из 4" in window.layout_message.text()
+
+    # Esc cancels partial entry and restores committed selection + export eligibility.
+    qtbot.keyClick(window.editor, Qt.Key.Key_Escape)
+    assert not window.is_drafting()
+    assert window.cards["front"].points == committed
+    controller.drain()
+    assert window.sheet is not None
+    assert window.pdf_button.isEnabled() and window.png_button.isEnabled()
+
+    # Valid 4-point completion commits exactly once on the 4th click.
+    window.pick_points()
+    valid_points = ((20, 20), (820, 20), (820, 510), (20, 510))
+    for i, pt in enumerate(valid_points):
+        viewport = window.editor.mapFromScene(QPointF(*pt))
+        qtbot.mouseClick(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=viewport)
+        if i < 3:
+            assert len(controller.pending) == 0
+    assert len(controller.pending) == 1
+    controller.drain()
+    assert window.sheet is not None and window.pdf_button.isEnabled()
+    for actual, expected in zip(window.cards["front"].points, valid_points):
+        assert actual == pytest.approx(expected, abs=3)
+
+    # Invalid 4-point completion blocks export with a persistent explanation;
+    # starting and Esc-cancelling another draft restores that persistent error.
+    window.pick_points()
+    crossing = ((20, 20), (820, 510), (820, 20), (20, 510))
+    for pt in crossing:
+        viewport = window.editor.mapFromScene(QPointF(*pt))
+        qtbot.mouseClick(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=viewport)
+    assert len(controller.pending) == 1
+    controller.drain()
+    assert window.sheet is None
+    assert not window.pdf_button.isEnabled()
+    assert "пересечений" in window.layout_message.text()
+
+    window.pick_points()
+    qtbot.mouseClick(
+        window.editor.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=window.editor.mapFromScene(QPointF(30, 30)),
+    )
+    assert (
+        "угол 1 из 4" in window.layout_message.text()
+        or "угол 2 из 4" in window.layout_message.text()
+    )
+    qtbot.keyClick(window.editor, Qt.Key.Key_Escape)
+    controller.drain()
+    assert window.sheet is None and not window.pdf_button.isEnabled()
+    assert "пересечений" in window.layout_message.text()
+    window.close()
+
+
+def test_handle_drag_suspends_export_escape_cancels_and_release_commits_once(
+    qtbot, tmp_path, synthetic_card
+):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    origin = window.cards["front"].points
+    rev_before = window.cards["front"].revision
+
+    start = window.editor.mapFromScene(window.editor.handles[0].pos())
+    mid = window.editor.mapFromScene(QPointF(110, 90))
+    dest = window.editor.mapFromScene(QPointF(160, 120))
+
+    # Press begins drag transaction and immediately suspends export.
+    qtbot.mousePress(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    assert window.is_drafting()
+    assert window.sheet is None
+    assert not window.pdf_button.isEnabled() and not window.png_button.isEnabled()
+    assert not window.inspect_button.isEnabled()
+    assert "Редактирование выделения" in window.layout_message.text()
+    assert "Угол 1 из 4" in window.layout_message.text()
+
+    # Mouse moves must not enqueue full-resolution card renders.
+    qtbot.mouseMove(window.editor.viewport(), mid)
+    qtbot.mouseMove(window.editor.viewport(), dest)
+    assert len(controller.pending) == 0
+
+    # Esc during drag restores handles and triggers sheet preview restore only;
+    # late mouseRelease must not enqueue any card render task.
+    qtbot.keyClick(window.editor, Qt.Key.Key_Escape)
+    assert not window.is_drafting()
+    assert window.editor.points() == origin
+    pending_after_cancel = len(controller.pending)
+    assert pending_after_cancel == 1
+    qtbot.mouseRelease(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=dest)
+    assert len(controller.pending) == pending_after_cancel
+    controller.drain()
+    assert window.cards["front"].revision == rev_before
+    assert window.sheet is not None and window.pdf_button.isEnabled()
+
+    # Press + release without moving is a no-op that restores export without bumping revision.
+    qtbot.mousePress(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    assert window.sheet is None
+    qtbot.mouseRelease(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    assert len(controller.pending) == 1
+    controller.drain()
+    assert window.cards["front"].revision == rev_before
+    assert window.sheet is not None and window.pdf_button.isEnabled()
+
+    # Dragging to a new valid position commits once on release.
+    qtbot.mousePress(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    qtbot.mouseMove(window.editor.viewport(), dest)
+    assert len(controller.pending) == 0
+    qtbot.mouseRelease(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=dest)
+    assert len(controller.pending) == 1
+    controller.drain()
+    assert window.cards["front"].points[0] == pytest.approx((160, 120), abs=8)
+    assert window.sheet is not None and window.pdf_button.isEnabled()
+
+    # Dragging handle 0 past opposite corner commits once and blocks export with error.
+    bad_start = window.editor.mapFromScene(window.editor.handles[0].pos())
+    bad_dest = window.editor.mapFromScene(QPointF(850, 530))
+    qtbot.mousePress(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=bad_start)
+    qtbot.mouseMove(window.editor.viewport(), bad_dest)
+    qtbot.mouseRelease(window.editor.viewport(), Qt.MouseButton.LeftButton, pos=bad_dest)
+    assert len(controller.pending) == 1
+    controller.drain()
+    assert window.sheet is None and not window.pdf_button.isEnabled()
+    assert window.cards["front"].error is not None
+    window.close()
+
+
+def test_inspector_rejects_stale_success_and_error_across_edit_replace_remove_and_close(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+
+    # 1. Edit card before inspector task finishes (stale success and stale error).
+    window.inspect_card()
+    assert len(controller.pending) == 1
+    window.radius.setValue(3)
+    controller.complete_at(0)  # Stale inspector success
+    assert not window.findChildren(InspectorDialog)
+    controller.drain()
+
+    window.inspect_card()
+    assert len(controller.pending) == 1
+    window.radius.setValue(4)
+    controller.fail_at(0, "Устаревшая ошибка инспектора")
+    assert not window.findChildren(InspectorDialog)
+    assert not errors
+    controller.drain()
+
+    # 2. Replace side before inspector finishes.
+    window.inspect_card()
+    assert len(controller.pending) == 1
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    controller.complete_at(0)  # Stale inspector completes before replacement load finishes
+    assert not window.findChildren(InspectorDialog)
+    controller.drain()
+
+    # 3. Remove side before inspector finishes (both success and error).
+    window.inspect_card()
+    window.remove_side()
+    controller.complete_at(0)
+    assert not window.findChildren(InspectorDialog)
+    controller.drain()
+
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    controller.drain()
+    window.inspect_card()
+    window.remove_side()
+    controller.fail_at(0, "Ошибка удалённой стороны")
+    assert not window.findChildren(InspectorDialog)
+    assert not errors
+    controller.drain()
+
+    # 4. Close window before inspector finishes (stale success and stale error).
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    controller.drain()
+    window.inspect_card()
+    assert len(controller.pending) == 1
+    window.close()
+    assert window._closing and not window._closed
+    controller.succeed_at(0, QImage(10, 10, QImage.Format.Format_RGB888))
+    assert not window.findChildren(InspectorDialog)
+    assert window._closed
+
+    # Also check stale error path during window close on a fresh window.
+    window2, controller2 = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    window2.inspect_card()
+    window2.close()
+    assert window2._closing and not window2._closed
+    controller2.fail_at(0, "Ошибка после закрытия")
+    assert not errors
+    assert not window2.findChildren(InspectorDialog)
+    assert window2._closed
+
+
+def test_open_inspector_marks_itself_stale_on_edit_replace_and_remove(
+    qtbot, tmp_path, synthetic_card
+):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+
+    # Open inspector at current revision -> active & labelled with revision.
+    rev1 = window.cards["front"].revision
+    window.inspect_card()
+    controller.drain()
+    dialogs = window.findChildren(InspectorDialog)
+    assert len(dialogs) == 1
+    dialog1 = dialogs[0]
+    assert not dialog1.stale
+    assert f"#{rev1}" in dialog1.windowTitle()
+    assert "Актуальный" in dialog1.status_label.text()
+
+    # Editing side immediately marks the open snapshot stale.
+    window.radius.setValue(4)
+    assert dialog1.stale
+    assert "устарел" in dialog1.windowTitle()
+    assert "устарел" in dialog1.status_label.text().lower()
+    dialog1.close()
+    controller.drain()
+
+    # Replacing side marks an open snapshot stale immediately.
+    window.inspect_card()
+    controller.drain()
+    dialog2 = window.findChildren(InspectorDialog)[-1]
+    assert not dialog2.stale
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    assert dialog2.stale
+    assert "устарел" in dialog2.status_label.text().lower()
+    dialog2.close()
+    controller.drain()
+
+    # Removing side marks an open snapshot stale immediately.
+    window.inspect_card()
+    controller.drain()
+    dialog3 = window.findChildren(InspectorDialog)[-1]
+    assert not dialog3.stale
+    window.remove_side()
+    assert dialog3.stale
+    assert "убрана" in dialog3.status_label.text().lower()
+    dialog3.close()
+    controller.drain()
     window.close()

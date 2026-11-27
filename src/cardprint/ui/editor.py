@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 
 from ..geometry import ViewTransform
 
+CORNER_LABELS = ("верхний левый", "верхний правый", "нижний правый", "нижний левый")
+
 
 def to_qimage(image):
     rgb = image.convert("RGB")
@@ -54,15 +56,23 @@ class Handle(QGraphicsEllipseItem):
             self.editor.update_polygon()
         return super().itemChange(change, value)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.editor.picking:
+            self.editor.begin_handle_drag(self.index)
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
-        self.editor.selectionChanged.emit(self.editor.points())
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.editor.finish_handle_drag()
 
 
 class ImageView(QGraphicsView):
     """Scene units are source pixels; the view alone owns zoom and pan."""
 
     selectionChanged = Signal(object)
+    draftChanged = Signal(str, int)
+    draftCancelled = Signal()
 
     def __init__(self, editable=False, parent=None):
         super().__init__(parent)
@@ -75,6 +85,8 @@ class ImageView(QGraphicsView):
         self.picking = False
         self.pick_points = []
         self._pick_markers = []
+        self._dragging_handle: int | None = None
+        self._drag_origin_points: tuple[tuple[float, float], ...] | None = None
         self.auto_fit = True
         self.setBackgroundBrush(QColor("#dbe1e8"))
         self.setRenderHints(
@@ -85,6 +97,10 @@ class ImageView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setMinimumSize(280, 240)
 
+    @property
+    def is_drafting(self) -> bool:
+        return bool(self.picking or self._dragging_handle is not None)
+
     def set_image(self, image, source_size=None, points=None):
         self.handles = []
         self.polygon = None
@@ -92,6 +108,9 @@ class ImageView(QGraphicsView):
         self._pick_markers = []
         self.scene().clear()
         self.picking = False
+        self.pick_points = []
+        self._dragging_handle = None
+        self._drag_origin_points = None
         image_width, image_height = (
             (image.width(), image.height()) if isinstance(image, QImage) else image.size
         )
@@ -109,6 +128,9 @@ class ImageView(QGraphicsView):
 
     def set_points(self, points):
         self.picking = False
+        self.pick_points = []
+        self._dragging_handle = None
+        self._drag_origin_points = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
         for item in self._pick_markers:
             self.scene().removeItem(item)
@@ -137,15 +159,64 @@ class ImageView(QGraphicsView):
         if self.polygon is not None:
             self.polygon.setPolygon(QPolygonF([QPointF(*p) for p in self.points()]))
 
-    def begin_selection(self):
-        if not self.image_item:
+    def begin_handle_drag(self, index: int):
+        if not self.editable or self.picking:
             return
+        self._drag_origin_points = self.points()
+        self._dragging_handle = index
+        self.setFocus()
+        self.draftChanged.emit("drag", index + 1)
+
+    def finish_handle_drag(self):
+        if self._dragging_handle is None:
+            return
+        origin = self._drag_origin_points
+        self._dragging_handle = None
+        self._drag_origin_points = None
+        current = self.points()
+        if origin is not None and current == origin:
+            self.draftCancelled.emit()
+            return
+        self.selectionChanged.emit(current)
+
+    def begin_selection(self):
+        if not self.image_item or not self.editable:
+            return
+        if self._dragging_handle is not None:
+            self.cancel_draft(emit=False)
         self.picking = True
         self.pick_points = []
         for item in self._pick_markers:
             self.scene().removeItem(item)
         self._pick_markers = []
         self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus()
+        self.draftChanged.emit("pick", 1)
+
+    def cancel_draft(self, *, emit: bool = True) -> bool:
+        if not self.is_drafting:
+            return False
+        if self.picking:
+            self.picking = False
+            self.pick_points = []
+            for item in self._pick_markers:
+                self.scene().removeItem(item)
+            self._pick_markers = []
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        if self._dragging_handle is not None:
+            origin = self._drag_origin_points
+            handle_index = self._dragging_handle
+            self._dragging_handle = None
+            self._drag_origin_points = None
+            if 0 <= handle_index < len(self.handles):
+                self.handles[handle_index].ungrabMouse()
+            if origin is not None:
+                for handle, point in zip(self.handles, origin):
+                    handle.setPos(QPointF(*point))
+                self.update_polygon()
+        if emit:
+            self.draftCancelled.emit()
+        return True
 
     def mousePressEvent(self, event):
         if self.picking and event.button() == Qt.MouseButton.LeftButton:
@@ -161,15 +232,19 @@ class ImageView(QGraphicsView):
                 self.scene().addItem(marker)
                 self._pick_markers.append(marker)
                 if len(self.pick_points) == 4:
-                    self.set_points(self.pick_points)
+                    picked = tuple(self.pick_points)
+                    self.set_points(picked)
                     self.selectionChanged.emit(self.points())
+                else:
+                    self.draftChanged.emit("pick", len(self.pick_points) + 1)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape and self.picking:
-            self.set_points(self.points())
+        if event.key() == Qt.Key.Key_Escape and self.is_drafting:
+            self.cancel_draft()
+            event.accept()
             return
         super().keyPressEvent(event)
 

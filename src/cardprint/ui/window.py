@@ -43,10 +43,77 @@ from ..imaging import (
     rotated,
     round_corners,
 )
-from .editor import ImageView, pixmap, to_qimage
+from .editor import CORNER_LABELS, ImageView, pixmap, to_qimage
 from .tasks import Task
 
 SIDE_NAMES = {"front": "Лицевая сторона", "back": "Обратная сторона"}
+
+
+class InspectorDialog(QDialog):
+    def __init__(
+        self,
+        parent,
+        image,
+        side: str,
+        card: "Card",
+        revision: int,
+        load_generation: int,
+        view_toolbar_builder,
+        on_close=None,
+    ):
+        super().__init__(parent)
+        self.side = side
+        self.card = card
+        self.revision = revision
+        self.load_generation = load_generation
+        self.stale = False
+        self._on_close = on_close
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle(f"Проверка краёв · {SIDE_NAMES[side]} · правка #{revision}")
+        self.resize(1000, 720)
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel(f"Актуальный снимок · {SIDE_NAMES[side]} (правка #{revision}).")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        view = ImageView()
+        view.set_image(image)
+        layout.addWidget(view)
+        layout.addLayout(view_toolbar_builder(view))
+        layout.addWidget(
+            parent.button(
+                "1 пиксель изображения = 1 пиксель просмотра",
+                lambda: view.zoom(1 / view.transform().m11()),
+            )
+        )
+        layout.addWidget(
+            QLabel(
+                "Белое за пределами скругления. Содержимое карточки не улучшается и не перерисовывается."
+            )
+        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.finished.connect(self._notify_closed)
+
+    def _notify_closed(self, _result=0):
+        if self._on_close is not None:
+            callback = self._on_close
+            self._on_close = None
+            callback(self)
+
+    def mark_stale(self, reason: str):
+        if self.stale:
+            return
+        self.stale = True
+        self.setWindowTitle(
+            f"Проверка краёв · {SIDE_NAMES[self.side]} · устарел (правка #{self.revision})"
+        )
+        self.status_label.setText(f"⚠ {reason}")
+        self.status_label.setStyleSheet("color: #a34c00; font-weight: 600;")
+
+    def closeEvent(self, event):
+        self._notify_closed()
+        super().closeEvent(event)
 
 
 def thumbnail(image, limit=2000):
@@ -87,6 +154,10 @@ class MainWindow(QMainWindow):
         self.sheet = None
         self.layout_generation = 0
         self.load_generation = {"front": 0, "back": 0}
+        self.inspector_request_id = {"front": 0, "back": 0}
+        self.inspectors: list[InspectorDialog] = []
+        self.draft_message: str | None = None
+        self.draft_side: str | None = None
         self.tasks = {}
         self.pending_loads = set()
         self.original_paths = set()
@@ -94,6 +165,7 @@ class MainWindow(QMainWindow):
         self.pool.setMaxThreadCount(2)
         self.syncing = False
         self._closing = False
+        self._closed = False
         self._build_ui()
         self.layout_timer = QTimer(self)
         self.layout_timer.setSingleShot(True)
@@ -165,6 +237,8 @@ class MainWindow(QMainWindow):
         edit_layout.addWidget(self.source_label)
         self.editor = ImageView(editable=True)
         self.editor.selectionChanged.connect(self.selection_changed)
+        self.editor.draftChanged.connect(self.on_draft_changed)
+        self.editor.draftCancelled.connect(self.on_draft_cancelled)
         edit_layout.addWidget(self.editor, 1)
         self.editor_actions = []
         for names in (
@@ -291,6 +365,8 @@ class MainWindow(QMainWindow):
         return row
 
     def submit(self, function, success, error=None):
+        if self._closing or self._closed:
+            return
         task = Task(function)
         key = id(task)
         self.tasks[key] = task
@@ -304,7 +380,7 @@ class MainWindow(QMainWindow):
         self.tasks.pop(key, None)
         if not self.tasks:
             self.progress.hide()
-            if self._closing:
+            if self._closing and not self._closed:
                 self.close()
 
     def show_error(self, message):
@@ -364,14 +440,18 @@ class MainWindow(QMainWindow):
         )
 
     def assign_selected(self, side):
+        if self._closing or self._closed:
+            return
         item = self.sources.currentItem()
         if item is None:
             self.statusBar().showMessage("Сначала выберите файл или страницу слева.")
             return
         source = item.data(Qt.ItemDataRole.UserRole)
+        self._clear_draft()
         self.load_generation[side] += 1
         token = self.load_generation[side]
         self.pending_loads.add(side)
+        self.refresh_inspectors()
         self.invalidate_sheet("Загрузка выбранной стороны…")
 
         def work():
@@ -386,12 +466,14 @@ class MainWindow(QMainWindow):
             )
 
         def done(result):
-            if token != self.load_generation[side]:
+            if self._closing or self._closed or token != self.load_generation[side]:
                 return
             self.pending_loads.discard(side)
+            self._clear_draft()
             original, points, display, found = result
             card = Card(source, original, points, display=display)
             self.cards[side] = card
+            self.refresh_inspectors()
             self.side_combo.setCurrentIndex(0 if side == "front" else 1)
             self.active_side = side
             self.show_card()
@@ -403,7 +485,7 @@ class MainWindow(QMainWindow):
             )
 
         def failed(message):
-            if token == self.load_generation[side]:
+            if not (self._closing or self._closed) and token == self.load_generation[side]:
                 self.pending_loads.discard(side)
                 self.show_error(message)
                 self.layout_changed()
@@ -419,15 +501,66 @@ class MainWindow(QMainWindow):
             )
 
     def remove_side(self):
+        if self.draft_side == self.active_side:
+            self._clear_draft()
         self.load_generation[self.active_side] += 1
         self.pending_loads.discard(self.active_side)
         self.cards.pop(self.active_side, None)
+        self.refresh_inspectors()
         self.show_card()
         self.layout_changed()
 
     def change_side(self):
+        had_draft = self._clear_draft()
         self.active_side = self.side_combo.currentData()
         self.show_card()
+        if had_draft:
+            self.refresh_sheet()
+
+    def is_drafting(self) -> bool:
+        return self.draft_message is not None or self.editor.is_drafting
+
+    def _clear_draft(self) -> bool:
+        had_draft = self.is_drafting()
+        self.editor.cancel_draft(emit=False)
+        self.draft_message = None
+        self.draft_side = None
+        return had_draft
+
+    def on_draft_changed(self, kind: str, corner: int):
+        label = CORNER_LABELS[corner - 1]
+        if kind == "pick":
+            message = (
+                f"Выделение по 4 точкам — укажите угол {corner} из 4 ({label}). "
+                "Экспорт приостановлен. Esc — отмена."
+            )
+        else:
+            message = (
+                f"Редактирование выделения… Угол {corner} из 4 ({label}). "
+                "Экспорт приостановлен до завершения. Esc — отмена."
+            )
+        self.draft_message = message
+        self.draft_side = self.active_side
+        self.layout_timer.stop()
+        self.invalidate_sheet(message)
+        self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
+        self.statusBar().showMessage(message)
+        self._sync_controls()
+
+    def on_draft_cancelled(self):
+        self.draft_message = None
+        self.draft_side = None
+        self.layout_timer.stop()
+        self.statusBar().showMessage("Выделение отменено. Восстановлены предыдущие углы.")
+        self._sync_controls()
+        self.refresh_sheet()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.editor.is_drafting:
+            self.editor.cancel_draft()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def show_card(self):
         card = self.cards.get(self.active_side)
@@ -449,7 +582,12 @@ class MainWindow(QMainWindow):
         self.radius.setEnabled(card is not None)
         self.reset_button.setEnabled(card is not None)
         self.inspect_button.setEnabled(
-            bool(card and card.rendered and card.ready_revision == card.revision)
+            bool(
+                card
+                and card.rendered
+                and card.ready_revision == card.revision
+                and not (self.is_drafting() and self.draft_side == self.active_side)
+            )
         )
         if card:
             self.size_mode.setCurrentIndex(self.size_mode.findData(card.size.mode))
@@ -496,6 +634,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(1, "Предпросмотр A4 · обновление")
 
     def selection_changed(self, points):
+        self.draft_message = None
+        self.draft_side = None
         card = self.cards.get(self.active_side)
         if card is None:
             return
@@ -504,12 +644,12 @@ class MainWindow(QMainWindow):
         self.render_card(self.active_side)
 
     def pick_points(self):
+        if self.active_side not in self.cards:
+            return
         self.editor.begin_selection()
-        self.statusBar().showMessage(
-            "Щёлкните 4 угла: верхний левый → верхний правый → нижний правый → нижний левый. Esc — отмена."
-        )
 
     def reset_selection(self):
+        self._clear_draft()
         card = self.cards.get(self.active_side)
         if card:
             card.points = full_quad(*card.source_size)
@@ -518,19 +658,31 @@ class MainWindow(QMainWindow):
             self.render_card(self.active_side)
 
     def autodetect(self):
+        had_draft = self._clear_draft()
+        if had_draft:
+            self._sync_controls()
         side = self.active_side
         card = self.cards.get(side)
         if not card:
+            if had_draft:
+                self.refresh_sheet()
             return
         revision, turns = card.revision, card.turns
 
         def done(points):
-            if self.cards.get(side) is not card or card.revision != revision:
+            if (
+                self._closing
+                or self._closed
+                or self.cards.get(side) is not card
+                or card.revision != revision
+            ):
                 return
             if points is None:
                 self.statusBar().showMessage(
                     "Контур не найден. Ручное выделение доступно: нажмите «Выделить 4 точки»."
                 )
+                if had_draft:
+                    self.refresh_sheet()
                 return
             card.points = points
             card.cropped = None
@@ -539,9 +691,20 @@ class MainWindow(QMainWindow):
             self.render_card(side)
             self.statusBar().showMessage("Контур найден. Проверьте углы и края результата.")
 
-        self.submit(lambda: detect_quad(rotated(card.original, turns)), done)
+        def failed(message):
+            if (
+                not (self._closing or self._closed)
+                and self.cards.get(side) is card
+                and card.revision == revision
+            ):
+                self.show_error(message)
+                if had_draft:
+                    self.refresh_sheet()
+
+        self.submit(lambda: detect_quad(rotated(card.original, turns)), done, failed)
 
     def rotate(self):
+        self._clear_draft()
         side = self.active_side
         card = self.cards.get(side)
         if not card:
@@ -552,6 +715,7 @@ class MainWindow(QMainWindow):
         self.render_card(side, update_display=True)
 
     def reset_card(self):
+        self._clear_draft()
         card = self.cards.get(self.active_side)
         if card:
             card.turns = 0
@@ -574,6 +738,8 @@ class MainWindow(QMainWindow):
             self._sync_controls()
 
     def render_card(self, side, update_display=False):
+        if self._closing or self._closed:
+            return
         card = self.cards[side]
         card.revision += 1
         revision = card.revision
@@ -587,7 +753,12 @@ class MainWindow(QMainWindow):
             card.size,
             card.cropped,
         )
-        self.invalidate_sheet()
+        self.refresh_inspectors()
+        if self.is_drafting():
+            self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
+            self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
+        else:
+            self.invalidate_sheet()
         self._sync_controls()
 
         def work():
@@ -604,7 +775,13 @@ class MainWindow(QMainWindow):
             return cropped, rendered, display
 
         def done(result):
-            if result is None or self.cards.get(side) is not card or card.revision != revision:
+            if (
+                self._closing
+                or self._closed
+                or result is None
+                or self.cards.get(side) is not card
+                or card.revision != revision
+            ):
                 return
             card.cropped, card.rendered, display = result
             card.ready_revision = revision
@@ -619,11 +796,19 @@ class MainWindow(QMainWindow):
             self.layout_changed()
 
         def failed(message):
-            if self.cards.get(side) is card and card.revision == revision:
+            if (
+                not (self._closing or self._closed)
+                and self.cards.get(side) is card
+                and card.revision == revision
+            ):
                 card.error = message
-                self.invalidate_sheet(message)
-                self.layout_message.setStyleSheet("color: #ad352c")
-                self.tabs.setTabText(1, "Предпросмотр A4 · исправьте выделение")
+                if self.is_drafting():
+                    self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
+                    self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
+                else:
+                    self.invalidate_sheet(message)
+                    self.layout_message.setStyleSheet("color: #ad352c")
+                    self.tabs.setTabText(1, "Предпросмотр A4 · исправьте выделение")
 
         self.submit(work, done, failed)
 
@@ -637,12 +822,23 @@ class MainWindow(QMainWindow):
         )
 
     def layout_changed(self):
-        if self.syncing:
+        if self.syncing or self._closing or self._closed:
+            return
+        if self.is_drafting():
+            self.layout_timer.stop()
+            self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
+            self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
             return
         self.invalidate_sheet()
         self.layout_timer.start()
 
     def refresh_sheet(self):
+        if self._closing or self._closed:
+            return
+        if self.is_drafting():
+            self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
+            self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
+            return
         if self.pending_loads:
             self.layout_message.setText("Загрузка выбранной стороны…")
             return
@@ -675,7 +871,12 @@ class MainWindow(QMainWindow):
             return
 
         def done(preview):
-            if generation != self.layout_generation:
+            if (
+                self._closing
+                or self._closed
+                or generation != self.layout_generation
+                or self.is_drafting()
+            ):
                 return
             self.sheet = sheet
             self.preview.set_image(preview)
@@ -695,40 +896,87 @@ class MainWindow(QMainWindow):
 
         self.submit(lambda: render_sheet(sheet), done)
 
+    def is_inspector_fresh(
+        self, side: str, card: Card, revision: int, load_gen: int, request_id: int
+    ) -> bool:
+        if self._closing or self._closed:
+            return False
+        if self.cards.get(side) is not card:
+            return False
+        if self.load_generation.get(side) != load_gen or side in self.pending_loads:
+            return False
+        if card.revision != revision or card.ready_revision != revision:
+            return False
+        if self.inspector_request_id.get(side) != request_id:
+            return False
+        return True
+
     def inspect_card(self):
-        card = self.cards.get(self.active_side)
+        if self._closing or self._closed:
+            return
+        side = self.active_side
+        card = self.cards.get(side)
         if not card or card.ready_revision != card.revision or card.rendered is None:
             return
-        image, side = card.rendered, self.active_side
-        self.submit(lambda: to_qimage(image), lambda result: self.show_inspector(result, side))
+        if self.is_drafting() and self.draft_side == side:
+            return
+        image = card.rendered
+        revision = card.revision
+        load_gen = self.load_generation[side]
+        self.inspector_request_id[side] += 1
+        request_id = self.inspector_request_id[side]
 
-    def show_inspector(self, image, side):
-        dialog = QDialog(self)
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dialog.setWindowTitle("Проверка краёв · " + SIDE_NAMES[side])
-        dialog.resize(1000, 720)
-        layout = QVBoxLayout(dialog)
-        view = ImageView()
-        view.set_image(image)
-        layout.addWidget(view)
-        layout.addLayout(self.view_toolbar(view))
-        layout.addWidget(
-            self.button(
-                "1 пиксель изображения = 1 пиксель просмотра",
-                lambda: view.zoom(1 / view.transform().m11()),
-            )
+        def done(result):
+            if self.is_inspector_fresh(side, card, revision, load_gen, request_id):
+                self.show_inspector(result, side, card, revision, load_gen)
+
+        def failed(message):
+            if self.is_inspector_fresh(side, card, revision, load_gen, request_id):
+                self.show_error(message)
+
+        self.submit(lambda: to_qimage(image), done, failed)
+
+    def _remove_inspector(self, dialog: InspectorDialog):
+        if dialog in self.inspectors:
+            self.inspectors.remove(dialog)
+
+    def show_inspector(self, image, side: str, card: Card, revision: int, load_gen: int):
+        dialog = InspectorDialog(
+            self,
+            image,
+            side,
+            card,
+            revision,
+            load_gen,
+            self.view_toolbar,
+            on_close=self._remove_inspector,
         )
-        layout.addWidget(
-            QLabel(
-                "Белое за пределами скругления. Содержимое карточки не улучшается и не перерисовывается."
-            )
-        )
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
+        self.inspectors.append(dialog)
         dialog.show()
 
+    def refresh_inspectors(self):
+        for dialog in list(self.inspectors):
+            if dialog.stale:
+                continue
+            current = self.cards.get(dialog.side)
+            if dialog.side in self.pending_loads:
+                dialog.mark_stale("Снимок устарел: загружается новый документ для этой стороны.")
+            elif current is None:
+                dialog.mark_stale("Снимок устарел: сторона была убрана.")
+            elif (
+                current is not dialog.card
+                or self.load_generation.get(dialog.side) != dialog.load_generation
+            ):
+                dialog.mark_stale("Снимок устарел: для стороны назначен другой документ.")
+            elif current.revision != dialog.revision:
+                dialog.mark_stale(
+                    f"Снимок устарел: параметры стороны изменены (правка #{current.revision})."
+                )
+
     def save(self, kind):
+        if self.is_drafting():
+            self.show_error("Завершите выделение или нажмите Esc для отмены перед экспортом.")
+            return
         if self.sheet is None:
             self.show_error("Дождитесь обработки и исправьте выделение или компоновку.")
             return
@@ -767,6 +1015,8 @@ class MainWindow(QMainWindow):
         sheet = self.sheet
 
         def done(_):
+            if self._closing or self._closed:
+                return
             self.export_path = target
             self.open_button.show()
             self.export_message.setText(f"Сохранено: {target.name}\n\n{PRINT_HINT}")
@@ -781,11 +1031,19 @@ class MainWindow(QMainWindow):
             self.show_error("Не удалось открыть файл в системной программе.")
 
     def closeEvent(self, event):
+        if self._closed:
+            event.accept()
+            return
+        self.layout_timer.stop()
+        self._clear_draft()
         if self.tasks:
             self._closing = True
             self.statusBar().showMessage("Завершение фоновых операций перед закрытием…")
             self.centralWidget().setEnabled(False)
             event.ignore()
         else:
-            self.layout_timer.stop()
+            self._closed = True
+            for dialog in list(self.inspectors):
+                dialog.close()
+            self.inspectors.clear()
             event.accept()

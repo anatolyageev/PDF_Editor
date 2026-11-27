@@ -42,10 +42,36 @@ kept invalid-selection errors visible during layout changes; made PDF page numbe
 visible beneath thumbnails; rejected corner ordering that would mirror the document;
 and added export support for filesystems without hard links.
 
+### `T-18` (2026-11-27) — Draft selection export blocking & inspector freshness
+
+- Added draft transaction tracking (`draftChanged` / `draftCancelled`, `is_drafting`)
+  for four-point entry and corner-handle dragging in `src/cardprint/ui/editor.py`
+  and `src/cardprint/ui/window.py`.
+- Starting a draft immediately clears the ready `Sheet`, disables PDF/PNG export
+  and active-side inspection, and shows progress with the current corner (`1`–`4`).
+  Valid completion commits once; `Esc` (and no-op handle clicks) restores the
+  previous committed corners and export eligibility without mutating card state.
+- Added `InspectorDialog`, `inspector_request_id`, `is_inspector_fresh`, and
+  `refresh_inspectors` so stale inspector successes and errors are rejected across
+  edits, side replacement/removal, and window closing, and open snapshots mark
+  themselves stale immediately when superseded.
+- Added deterministic out-of-order UI tests (`ManualTaskController`) in
+  `tests/test_ui.py`.
+- Next ready tasks in [TASKS.md](TASKS.md): `T-19` (depends on `T-18`) and `T-01`
+  (no dependencies).
+
 ## Recorded implementation verification
 
-The following results were obtained **during the implementation iteration on
-2026-11-26**. Documentation-only updates do not constitute a rerun of these checks.
+The following results were obtained **after completing `T-18` on 2026-11-27**
+(Qt `offscreen`, Linux):
+
+| Check | Result and scope |
+| --- | --- |
+| `uv run pytest -q` | **36 passed** (`4.07s`), including 7 Qt `offscreen` UI tests (4 new deterministic `T-18` tests). |
+| `uv run ruff check src tests scripts` | All checks passed. |
+| `uv run ruff format --check src tests scripts` | 16 files already formatted. |
+
+Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-18`):
 
 | Check | Result and scope |
 | --- | --- |

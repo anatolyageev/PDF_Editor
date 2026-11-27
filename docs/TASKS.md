@@ -40,7 +40,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 | ID | Milestone | Title | Status | Depends On |
 | --- | --- | --- | --- | --- |
-| `T-18` | M0 · Reliability | Block export during draft selection and reject stale inspector results | `TODO` | — |
+| `T-18` | M0 · Reliability | Block export during draft selection and reject stale inspector results | `DONE` | — |
 | `T-19` | M0 · Reliability | Isolate PyMuPDF in a process and bound PDF scheduling/caches | `TODO` | `T-18` |
 | `T-21` | M0 · Reliability | Extract shared safe-save and original/source identity guards | `TODO` | `T-19` |
 | `T-01` | M1 · Foundation & UX | Extract domain models from `ui/window.py` into `src/cardprint/model.py` | `TODO` | — |
@@ -69,7 +69,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-18`: Block export during draft selection and reject stale inspector results
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** None
 - **Target files:** `src/cardprint/ui/editor.py`, `src/cardprint/ui/window.py`, `tests/test_ui.py`
 - **Goal:** Correct baseline state ambiguities before changing the editor appearance.
@@ -78,7 +78,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - Valid completion commits once; `Esc` restores the previous committed selection and export eligibility. Invalid completion retains a persistent explanation and blocks export until corrected.
   - Inspector requests check card identity, revision and window/session lifetime before opening; stale successes/errors cannot open obsolete results. Already-open snapshots clearly indicate if they became stale.
   - Deterministic UI tests use controlled completion order for partial entry, drag, Escape, invalid selection, replacement/removal, inspector and close; do not rely on sleep-based races.
-- **Verification:** Target `tests/test_ui.py`, then the full quality gate.
+- **Verification:** `uv run pytest -q tests/test_ui.py` (7 passed, `offscreen`), `uv run pytest -q` (36 passed, `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (16 files formatted).
 
 ### `T-19`: Isolate PyMuPDF in a process and bound PDF scheduling/caches
 
