@@ -264,7 +264,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-07`: Add Cyrillic TTF font resolver (`fonts.py`), `TextAnnotation`, and shared text export
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-01`, `T-19`
 - **Goal:** Build cross-platform Cyrillic TrueType font discovery and shared millimeter-accurate text rendering for A4 PDF and PNG/preview output.
 - **Target files:**
@@ -282,9 +282,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - Tests verify Cyrillic text extraction from exported PDF via PyMuPDF (`page.get_text()`) and visual pixel presence in exported PNG (including rotated/semi-transparent watermarks).
   - Define a shared `TextLayout` with first-line baseline anchoring, explicit line advances, alignment, clockwise angle convention, stacking and rotated ink bounds as in DESIGN §6. Qt/Pillow/PDF consume the same layout; do not claim equivalent default backend metrics. Reject nonfinite values, unsupported glyphs and out-of-sheet text without clipping/shrinking.
   - Compare PDF renders against PNG/preview text bounds (target ≤0.2 mm at 300 DPI, allowing antialiasing) for multiline/rotated/transparent text. Verify font resources in an installed wheel outside the checkout; no dependency on system-installed fonts.
-- **Verification:**
-  - `uv run pytest -q tests/test_fonts.py tests/test_export.py`
-  - `uv run pytest -q && uv run ruff check src tests scripts && uv run ruff format --check src tests scripts`
+- **Verification:** `uv run pytest -q tests/test_fonts.py tests/test_export.py` (18 passed), `uv run pytest -q` (106 passed, 1 pre-existing `BytesIO` unraisable warning, `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (24 files formatted).
 
 ---
 

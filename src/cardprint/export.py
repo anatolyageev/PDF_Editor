@@ -2,6 +2,7 @@
 
 import errno
 import hashlib
+import math
 import os
 import shutil
 import tempfile
@@ -14,7 +15,17 @@ from PIL import Image, ImageDraw
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
-from .geometry import A4_HEIGHT_MM, A4_WIDTH_MM, MM_TO_PT, Placement, crop_marks
+from .fonts import layout_text_annotation, load_pil_font, register_reportlab_font
+from .geometry import (
+    A4_HEIGHT_MM,
+    A4_WIDTH_MM,
+    MM_TO_PT,
+    Placement,
+    TextAnnotation,
+    TextLayout,
+    crop_marks,
+    parse_hex_color,
+)
 from .pdf_worker import PdfWorkerClient, get_default_pdf_worker
 
 PRINT_HINT = "Для сохранения размера печатайте в масштабе 100% / Фактический размер"
@@ -266,6 +277,7 @@ class Sheet:
     images: dict[str, Image.Image]
     placements: list[Placement]
     crop_marks: bool = False
+    annotations: tuple[TextAnnotation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -275,6 +287,7 @@ class ExportSnapshot:
     revisions: tuple[tuple[str, int], ...] = ()
     source_fingerprints: tuple[SourceFingerprint, ...] = ()
     crop_marks: bool = False
+    annotations: tuple[TextAnnotation, ...] = ()
 
 
 def snapshot_sheet(
@@ -290,10 +303,94 @@ def snapshot_sheet(
         revisions=tuple(revisions),
         source_fingerprints=tuple(source_fingerprints),
         crop_marks=sheet.crop_marks,
+        annotations=tuple(sheet.annotations),
     )
 
 
+def _prepare_text_layouts(sheet: Sheet) -> tuple[TextLayout, ...]:
+    return tuple(layout_text_annotation(ann, validate_bounds=True) for ann in sheet.annotations)
+
+
+def _draw_text_annotation_pil(target: Image.Image, layout: TextLayout, dpi: float) -> None:
+    ann = layout.annotation
+    scale = float(dpi) / 25.4
+    pil_font = load_pil_font(ann.font_family, ann.font_size_pt, dpi)
+    r, g, b = parse_hex_color(ann.color_hex)
+
+    pad = 16
+    sheet_w, sheet_h = target.size
+    ax_sheet = float(ann.x_mm) * scale
+    ay_sheet = float(ann.y_mm) * scale
+    lx0 = math.floor(layout.local_bounds_mm[0] * scale) - pad
+    ly0 = math.floor(layout.local_bounds_mm[1] * scale) - pad
+    lx1 = math.ceil(layout.local_bounds_mm[2] * scale) + pad
+    ly1 = math.ceil(layout.local_bounds_mm[3] * scale) + pad
+
+    local = Image.new("RGBA", (max(1, lx1 - lx0), max(1, ly1 - ly0)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(local)
+
+    if ann.angle_deg == 0.0:
+        sx0 = math.floor(ax_sheet) + lx0
+        sy0 = math.floor(ay_sheet) + ly0
+        origin_x = ax_sheet - sx0
+        origin_y = ay_sheet - sy0
+    else:
+        origin_x = float(-lx0)
+        origin_y = float(-ly0)
+
+    for line in layout.lines:
+        if line.text:
+            draw.text(
+                (origin_x + line.offset_x_mm * scale, origin_y + line.baseline_y_mm * scale),
+                line.text,
+                font=pil_font,
+                fill=(r, g, b, 255),
+                anchor="ls",
+            )
+    if ann.opacity < 1.0:
+        alpha = local.getchannel("A").point(lambda v: round(v * float(ann.opacity)))
+        local.putalpha(alpha)
+
+    if ann.angle_deg == 0.0:
+        dx0 = max(0, sx0)
+        dy0 = max(0, sy0)
+        dx1 = min(sheet_w, sx0 + local.width)
+        dy1 = min(sheet_h, sy0 + local.height)
+        if dx1 <= dx0 or dy1 <= dy0:
+            return
+        overlay = local.crop((dx0 - sx0, dy0 - sy0, dx1 - sx0, dy1 - sy0))
+    else:
+        dx0 = max(0, math.floor(layout.bounds_mm[0] * scale) - 4)
+        dy0 = max(0, math.floor(layout.bounds_mm[1] * scale) - 4)
+        dx1 = min(sheet_w, math.ceil(layout.bounds_mm[2] * scale) + 4)
+        dy1 = min(sheet_h, math.ceil(layout.bounds_mm[3] * scale) + 4)
+        if dx1 <= dx0 or dy1 <= dy0:
+            return
+        theta = math.radians(float(ann.angle_deg))
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        coeffs = (
+            cos_t,
+            sin_t,
+            origin_x + (dx0 - ax_sheet) * cos_t + (dy0 - ay_sheet) * sin_t,
+            -sin_t,
+            cos_t,
+            origin_y - (dx0 - ax_sheet) * sin_t + (dy0 - ay_sheet) * cos_t,
+        )
+        overlay = local.transform(
+            (dx1 - dx0, dy1 - dy0),
+            Image.Transform.AFFINE,
+            coeffs,
+            resample=Image.Resampling.BICUBIC,
+        )
+
+    tile = target.crop((dx0, dy0, dx1, dy1)).convert("RGBA")
+    composed = Image.alpha_composite(tile, overlay).convert("RGB")
+    target.paste(composed, (dx0, dy0))
+
+
 def render_sheet(sheet: Sheet, dpi: float = 120) -> Image.Image:
+    layouts = _prepare_text_layouts(sheet)
     scale = dpi / 25.4
     result = Image.new("RGB", (round(A4_WIDTH_MM * scale), round(A4_HEIGHT_MM * scale)), "white")
     if sheet.crop_marks:
@@ -312,10 +409,13 @@ def render_sheet(sheet: Sheet, dpi: float = 120) -> Image.Image:
         )
         resized = sheet.images[item.side].resize((right - x, bottom - y), Image.Resampling.LANCZOS)
         result.paste(resized, (x, y))
+    for layout in layouts:
+        _draw_text_annotation_pil(result, layout, dpi)
     return result
 
 
 def _write_pdf(sheet: Sheet, path: Path):
+    layouts = _prepare_text_layouts(sheet)
     pdf = canvas.Canvas(
         str(path), pagesize=(A4_WIDTH_MM * MM_TO_PT, A4_HEIGHT_MM * MM_TO_PT), pageCompression=1
     )
@@ -341,6 +441,25 @@ def _write_pdf(sheet: Sheet, path: Path):
             item.width_mm * MM_TO_PT,
             item.height_mm * MM_TO_PT,
         )
+    for layout in layouts:
+        ann = layout.annotation
+        rl_font = register_reportlab_font(ann.font_family)
+        r, g, b = parse_hex_color(ann.color_hex)
+        pdf.saveState()
+        pdf.setFillColorRGB(r / 255.0, g / 255.0, b / 255.0)
+        pdf.setFillAlpha(float(ann.opacity))
+        pdf.setFont(rl_font, float(ann.font_size_pt))
+        pdf.translate(float(ann.x_mm) * MM_TO_PT, (A4_HEIGHT_MM - float(ann.y_mm)) * MM_TO_PT)
+        if ann.angle_deg != 0.0:
+            pdf.rotate(-float(ann.angle_deg))
+        for line in layout.lines:
+            if line.text:
+                pdf.drawString(
+                    line.offset_x_mm * MM_TO_PT,
+                    -line.baseline_y_mm * MM_TO_PT,
+                    line.text,
+                )
+        pdf.restoreState()
     pdf.showPage()
     pdf.save()
 

@@ -1,7 +1,9 @@
 import errno
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pymupdf
@@ -17,7 +19,8 @@ from cardprint.export import (
     export_sheet,
     render_sheet,
 )
-from cardprint.geometry import MM_TO_PT, Layout, arrange
+from cardprint.fonts import layout_text_annotation
+from cardprint.geometry import MM_TO_PT, Layout, TextAnnotation, arrange
 from cardprint.imaging import discover
 
 
@@ -346,3 +349,183 @@ def test_crop_marks_shared_preview_png_vector_pdf_and_snapshot(tmp_path, enabled
             _, start, end = line["items"][0]
             assert tuple(v / MM_TO_PT for v in start) == pytest.approx(mark.start, abs=1e-4)
             assert tuple(v / MM_TO_PT for v in end) == pytest.approx(mark.end, abs=1e-4)
+
+
+def _ink_bbox_mm(array: np.ndarray, bounds_mm: tuple[float, float, float, float], dpi: float):
+    scale = dpi / 25.4
+    pad = round(2.5 * scale)
+    x0 = max(0, round(bounds_mm[0] * scale) - pad)
+    y0 = max(0, round(bounds_mm[1] * scale) - pad)
+    x1 = min(array.shape[1], round(bounds_mm[2] * scale) + pad)
+    y1 = min(array.shape[0], round(bounds_mm[3] * scale) + pad)
+    region = array[y0:y1, x0:x1]
+    mask = np.any(region < 252, axis=2)
+    assert mask.any()
+    ys, xs = np.where(mask)
+    return (
+        (x0 + xs.min()) / scale,
+        (y0 + ys.min()) / scale,
+        (x0 + xs.max()) / scale,
+        (y0 + ys.max()) / scale,
+    )
+
+
+def test_text_annotations_pdf_vector_cyrillic_and_png_rendering_match_within_0_2mm(
+    tmp_path, synthetic_card
+):
+    annotations = (
+        TextAnnotation(
+            id="caption",
+            text="Копия верна\nІіЇїЄєҐґ · № 42",
+            x_mm=20.0,
+            y_mm=25.0,
+            font_family="sans",
+            font_size_pt=14.0,
+            color_hex="#111827",
+            align="left",
+        ),
+        TextAnnotation(
+            id="serif-hdr",
+            text="Для предъявления",
+            x_mm=105.0,
+            y_mm=24.0,
+            font_family="serif",
+            font_size_pt=15.0,
+            color_hex="#1d4ed8",
+            align="center",
+        ),
+        TextAnnotation(
+            id="mono-date",
+            text="Дата: 27.11.2026",
+            x_mm=190.0,
+            y_mm=275.0,
+            font_family="mono",
+            font_size_pt=12.0,
+            color_hex="#334155",
+            align="right",
+        ),
+        TextAnnotation(
+            id="wm",
+            text="КОПИЯ ВЕРНА ✓\nТолько для работы",
+            x_mm=105.0,
+            y_mm=225.0,
+            font_family="sans-bold",
+            font_size_pt=22.0,
+            color_hex="#111827",
+            angle_deg=-30.0,
+            opacity=0.25,
+            align="center",
+            is_watermark=True,
+        ),
+    )
+    placements = arrange({"front": (85.6, 53.98)}, Layout())
+    sheet = Sheet({"front": synthetic_card}, placements, annotations=annotations)
+    pdf_path = tmp_path / "annotated.pdf"
+    png_path = tmp_path / "annotated.png"
+    export_sheet(sheet, pdf_path, "pdf")
+    export_sheet(sheet, png_path, "png")
+
+    with Image.open(png_path) as exported_png:
+        png_arr = np.array(exported_png)
+        assert exported_png.getpixel((0, 0)) == (255, 255, 255)
+
+    with pymupdf.open(pdf_path) as doc:
+        page = doc[0]
+        extracted = page.get_text()
+        assert "Копия верна" in extracted
+        assert "ІіЇїЄєҐґ · № 42" in extracted
+        assert "Для предъявления" in extracted
+        assert "Дата: 27.11.2026" in extracted
+        assert "КОПИЯ ВЕРНА ✓" in extracted
+        assert "Только для работы" in extracted
+        assert len(page.get_fonts()) >= 4
+
+        pix = page.get_pixmap(dpi=300, colorspace=pymupdf.csRGB, alpha=False)
+        pdf_arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)
+
+    for ann in annotations:
+        bounds = layout_text_annotation(ann).bounds_mm
+        pdf_box = _ink_bbox_mm(pdf_arr, bounds, 300.0)
+        png_box = _ink_bbox_mm(png_arr, bounds, 300.0)
+        for edge_pdf, edge_png in zip(pdf_box, png_box):
+            assert abs(edge_pdf - edge_png) <= 0.2
+
+    # Semi-transparent watermark must blend cleanly (~75% white + 25% dark), not solid black.
+    wm_bounds = layout_text_annotation(annotations[-1]).bounds_mm
+    scale = 300.0 / 25.4
+    wm_crop = png_arr[
+        round(wm_bounds[1] * scale) : round(wm_bounds[3] * scale),
+        round(wm_bounds[0] * scale) : round(wm_bounds[2] * scale),
+    ]
+    assert int(wm_crop.min()) > 150
+
+
+def test_text_annotation_stacking_order_and_invalid_export_blocking(tmp_path):
+    blue_card = Image.new("RGB", (856, 540), (30, 90, 180))
+    placements = arrange({"front": (85.6, 53.98)}, Layout())
+    card_center_x = placements[0].x_mm + placements[0].width_mm / 2
+    card_center_y = placements[0].y_mm + placements[0].height_mm / 2
+
+    # Even with is_watermark=True, an annotation paints above placed cards in tuple order.
+    over_card = TextAnnotation(
+        id="over-card",
+        text="ОБРАЗЕЦ",
+        x_mm=card_center_x,
+        y_mm=card_center_y,
+        font_family="sans-bold",
+        font_size_pt=20.0,
+        color_hex="#ffffff",
+        opacity=1.0,
+        align="center",
+        is_watermark=True,
+    )
+    sheet = Sheet({"front": blue_card}, placements, annotations=(over_card,))
+    rendered = np.array(render_sheet(sheet, dpi=150))
+    scale = 150.0 / 25.4
+    sample = rendered[
+        round((card_center_y - 6) * scale) : round((card_center_y + 2) * scale),
+        round((card_center_x - 20) * scale) : round((card_center_x + 20) * scale),
+    ]
+    assert np.all(sample.max(axis=2) >= 245) or int(sample.max()) == 255
+
+    # Out-of-bounds or missing-glyph annotations block PDF and PNG exports cleanly without staging files.
+    out_of_bounds = TextAnnotation(id="oob", text="За краем листа", x_mm=195.0, y_mm=30.0)
+    bad_glyph = TextAnnotation(
+        id="bad-glyph", text="Текст ✓", x_mm=20.0, y_mm=30.0, font_family="serif"
+    )
+    for bad_ann in (out_of_bounds, bad_glyph):
+        for kind in ("pdf", "png"):
+            target = tmp_path / f"{bad_ann.id}.{kind}"
+            with pytest.raises(ValueError):
+                export_sheet(
+                    Sheet({"front": blue_card}, placements, annotations=(bad_ann,)),
+                    target,
+                    kind,
+                )
+            assert not target.exists()
+    assert not list(tmp_path.glob(".cardprint-*"))
+
+
+def test_concurrent_text_exports_thread_safe(tmp_path, synthetic_card):
+    placements = arrange({"front": (85.6, 53.98)}, Layout())
+
+    def run_export(index: int) -> Path:
+        family = ("sans", "sans-bold", "serif", "mono")[index % 4]
+        kind = "pdf" if index % 2 == 0 else "png"
+        ann = TextAnnotation(
+            id=f"c-{index}",
+            text=f"Поток {index} · Кириллица ЄєЇї",
+            x_mm=25.0,
+            y_mm=30.0,
+            font_family=family,
+            font_size_pt=13.0,
+        )
+        sheet = Sheet({"front": synthetic_card}, placements, annotations=(ann,))
+        out = tmp_path / f"export_{index}.{kind}"
+        return export_sheet(sheet, out, kind)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outputs = list(pool.map(run_export, range(8)))
+
+    assert len(outputs) == 8
+    assert all(path.exists() for path in outputs)

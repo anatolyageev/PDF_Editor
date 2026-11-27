@@ -21,9 +21,10 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [app.py](../src/cardprint/app.py) | QApplication, `multiprocessing.freeze_support()`, Russian locale, Fusion style, persisted Light/Dark theme startup, Wayland selection when its socket is available, and MainWindow startup. |
 | [pdf_worker.py](../src/cardprint/pdf_worker.py) | Single spawned PyMuPDF child process, serializable IPC requests/results, request coalescing, crash recovery, and byte-bounded `ByteLRUCache` (32 MiB thumbnails / 128 MiB display pages). No Qt dependency. |
 | [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, batched PDF discovery via `pdf_worker`, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt or top-level PyMuPDF dependency. |
-| [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, arrange, position_group, and safe millimetre crop-mark segments. Independent of the UI. |
+| [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, arrange, position_group, safe millimetre crop-mark segments, and `TextAnnotation`/`TextLayout` models. Independent of the UI. |
+| [fonts.py](../src/cardprint/fonts.py) | Packaged Cyrillic TrueType resolver (`assets/fonts/`), cmap glyph validation, thread-safe ReportLab TTF registration, Pillow font loader, and shared `TextLayout` engine. No Qt or PyMuPDF dependency. |
 | [model.py](../src/cardprint/model.py) | Pure-Python domain models (`Card`, `SIDE_NAMES`), memory-bounded parametric `UndoStack` (`CardSnapshot`, `WorkspaceSnapshot`), and `WorkspaceCheckpoints` (`ExportRecord`). No Qt dependency. |
-| [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output, and staged PDF/PNG validation. No Qt dependency. |
+| [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output (cards, crop marks, vector/raster `TextAnnotation`), and staged PDF/PNG validation. No Qt dependency. |
 | [ui/theme.py](../src/cardprint/ui/theme.py) | `ThemePalette` (`light` / `dark`), `QPalette` + QSS stylesheet generation (`variant` button hierarchy, semantic `status` labels, card-style panels), and `QSettings` persistence. |
 | [ui/icons.py](../src/cardprint/ui/icons.py) | Bundled inline monochrome SVG icons rendered and palette-tinted via `QSvgRenderer` at `1×` / `2×` DPI with bounded LRU caching. |
 | [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection/nudge transactions, outside mask, live validation, numbered handles, bounded original-pixel loupe, canvas shortcuts, theme-aware colors, zoom, and pan; `SheetView` adds an A4 mm scene, rulers/margin guides, and transactional group positioning. |
@@ -55,7 +56,9 @@ additional persistence layer or a general-purpose PDF editing engine exists.
    and `rendered` images form a `Sheet`.
 6. `render_sheet` creates the screen preview at 120 DPI and PNG output at 300 DPI.
    `Sheet.crop_marks` enables the shared safe segment set in both raster rendering
-   and vector PDF output; `ExportSnapshot` freezes that flag with the placements.
+   and vector PDF output; `Sheet.annotations` renders `TextAnnotation` items in tuple
+   order above cards using `TextLayout` and packaged DejaVu fonts (`src/cardprint/assets/fonts/`).
+   `ExportSnapshot` freezes both flags/annotations with the placements.
    `SheetView` extracts reduced card pixmaps from the 120 DPI preview and positions
    them in an A4 millimetre scene, drawing crop marks from those same segments.
    `_write_pdf` uses the same images and placements, retaining the processed card's

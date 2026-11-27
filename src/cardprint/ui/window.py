@@ -2331,7 +2331,12 @@ class MainWindow(QMainWindow):
         )
         card_paths = tuple(card.source.path for card in self.cards.values())
         snap = snapshot_sheet(self.sheet, revisions=revisions, source_fingerprints=source_fps)
-        frozen_sheet = Sheet(dict(snap.images), list(snap.placements), crop_marks=snap.crop_marks)
+        frozen_sheet = Sheet(
+            dict(snap.images),
+            list(snap.placements),
+            crop_marks=snap.crop_marks,
+            annotations=snap.annotations,
+        )
         self._save_generation += 1
         save_gen = self._save_generation
 

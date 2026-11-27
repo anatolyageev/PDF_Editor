@@ -282,10 +282,54 @@ reported against commit `051d9b5` before proceeding to `T-02`:
 - Updated the Russian guide and architecture. Next ready task: `T-07` (Cyrillic
   font resolution and shared text export); not started.
 
+### `T-07` (2026-11-27) — Cyrillic TTF font resolver, `TextAnnotation`, and shared text export
+
+- Bundled redistributable DejaVu TrueType fonts (`DejaVuSans.ttf`,
+  `DejaVuSans-Bold.ttf`, `DejaVuSerif.ttf`, `DejaVuSansMono.ttf`) and
+  `LICENSE-DejaVu.txt` under `src/cardprint/assets/fonts/` for packaged resource
+  loading inside editable checkouts and built wheels.
+- Added `parse_hex_color`, `TextAnnotation`, `TextLineLayout`, `TextLayout`, and
+  `validate_text_bounds` in `src/cardprint/geometry.py` validating finite values,
+  font families, alignments, point sizes (`6`–`96`), angles (`-180°`–`180°`), opacity
+  (`0.05`–`1.0`), and A4 bounds without clipping or shrinking.
+- Added `src/cardprint/fonts.py` (`FONT_SPECS`, `get_font_bytes`,
+  `get_font_license_text`, `unsupported_glyphs`, `validate_text_glyphs`, thread-safe
+  `register_reportlab_font`, `load_pil_font`, and `layout_text_annotation`) using the
+  exact same packaged TTF bytes across ReportLab and Pillow with explicit Cyrillic,
+  Ukrainian (`ІіЇїЄєҐґ`), and stamp-symbol cmap validation and zero `PySide6`/`pymupdf`
+  imports.
+- Integrated `annotations: tuple[TextAnnotation, ...]` across `Sheet`, `ExportSnapshot`,
+  `snapshot_sheet`, `render_sheet`, and `_write_pdf` in `src/cardprint/export.py`
+  (plus `frozen_sheet` preservation in `src/cardprint/ui/window.py`), painting text
+  in tuple order above placed cards as selectable embedded-font vector Cyrillic PDF
+  text and aligned Pillow raster compositing.
+- Added 7 unit and integration tests across `tests/test_fonts.py` and
+  `tests/test_export.py` covering Qt/PyMuPDF-free imports, Russian/Ukrainian/stamp
+  coverage, missing-glyph/out-of-bounds rejection, wheel-outside-checkout resource
+  loading, selectable PDF extraction, `<= 0.2 mm` 300 DPI PDF-vs-PNG ink parity on
+  multiline/aligned/rotated/semi-transparent annotations, stacking order, and
+  concurrent thread-safe exports.
+- Next ready task in [TASKS.md](TASKS.md): `T-08` (interactive A4 text & watermark
+  editing UI with presets and Undo/Redo).
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-06` on 2026-11-27**
-(Linux, Python **3.14.2**, Qt `offscreen`):
+The following results were obtained **after completing `T-07` on 2026-11-27**
+(Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows
+and macOS remain unverified):
+
+| Check | Result and scope |
+| --- | --- |
+| `uv run pytest -q tests/test_fonts.py tests/test_export.py` | **18 passed** (`4.69s`), verified on the font & export implementation prior to the 1-line `Path` annotation import fix in `tests/test_export.py`. |
+| `uv run pytest -q` | **106 passed**, **1 warning** (`24.29s`), Qt `offscreen` (after the final edit). |
+| `uv run ruff check src tests scripts` | All checks passed (after the final edit). |
+| `uv run ruff format --check src tests scripts` | 24 files already formatted (after the final edit). |
+
+The full run showed the same pre-existing `PytestUnraisableExceptionWarning` on
+`BytesIO` finalization (`BufferError: Existing exports of data: object cannot be
+re-sized`); `gui_smoke.py` was not rerun for `T-07`.
+
+Previous `T-06` verification (2026-11-27):
 
 | Check | Result and scope |
 | --- | --- |

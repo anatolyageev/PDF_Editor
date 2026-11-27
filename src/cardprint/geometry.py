@@ -9,6 +9,28 @@ A4_WIDTH_MM = 210.0
 A4_HEIGHT_MM = 297.0
 MM_TO_PT = 72 / 25.4
 CROP_MARK_WIDTH_MM = 0.15
+VALID_FONT_FAMILIES: tuple[str, ...] = ("sans", "sans-bold", "serif", "mono")
+TEXT_ALIGNS: tuple[str, ...] = ("left", "center", "right")
+FONT_SIZE_MIN_PT = 6.0
+FONT_SIZE_MAX_PT = 96.0
+OPACITY_MIN = 0.05
+OPACITY_MAX = 1.0
+ANGLE_MIN_DEG = -180.0
+ANGLE_MAX_DEG = 180.0
+TEXT_LINE_ADVANCE_FACTOR = 1.2
+
+
+def parse_hex_color(color_hex: str) -> tuple[int, int, int]:
+    """Validate and decode an ``#RRGGBB`` color string into 8-bit RGB channels."""
+    if not isinstance(color_hex, str) or len(color_hex) != 7 or not color_hex.startswith("#"):
+        raise ValueError("Цвет текста должен быть в формате #RRGGBB.")
+    try:
+        r = int(color_hex[1:3], 16)
+        g = int(color_hex[3:5], 16)
+        b = int(color_hex[5:7], 16)
+    except ValueError as exc:
+        raise ValueError("Цвет текста должен быть в формате #RRGGBB.") from exc
+    return r, g, b
 
 
 @dataclass(frozen=True)
@@ -224,3 +246,86 @@ def arrange(sizes: dict[str, tuple[float, float]], layout: Layout) -> list[Place
         result.append(Placement(side, x, y, w, h))
         cursor += (h if vertical else w) + layout.gap_mm
     return result
+
+
+@dataclass(frozen=True)
+class TextAnnotation:
+    """Immutable A4 text block or watermark anchored on its first-line baseline in mm."""
+
+    id: str
+    text: str
+    x_mm: float
+    y_mm: float
+    font_family: str = "sans"
+    font_size_pt: float = 14.0
+    color_hex: str = "#111827"
+    angle_deg: float = 0.0
+    opacity: float = 1.0
+    align: str = "left"
+    is_watermark: bool = False
+
+    def __post_init__(self):
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("Идентификатор текстовой надписи не должен быть пустым.")
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("Текст надписи не должен быть пустым.")
+        numeric = (self.x_mm, self.y_mm, self.font_size_pt, self.angle_deg, self.opacity)
+        if any(isinstance(v, bool) or not isfinite(float(v)) for v in numeric):
+            raise ValueError("Числовые параметры текста должны быть конечными числами.")
+        if self.font_family not in VALID_FONT_FAMILIES:
+            raise ValueError(f"Неизвестное семейство шрифта: {self.font_family}.")
+        if self.align not in TEXT_ALIGNS:
+            raise ValueError(f"Неизвестное выравнивание текста: {self.align}.")
+        if not (FONT_SIZE_MIN_PT <= float(self.font_size_pt) <= FONT_SIZE_MAX_PT):
+            raise ValueError(
+                f"Размер шрифта должен быть от {FONT_SIZE_MIN_PT:.0f} до {FONT_SIZE_MAX_PT:.0f} pt."
+            )
+        if not (ANGLE_MIN_DEG <= float(self.angle_deg) <= ANGLE_MAX_DEG):
+            raise ValueError(
+                f"Угол поворота текста должен быть от {ANGLE_MIN_DEG:.0f}° до {ANGLE_MAX_DEG:.0f}°."
+            )
+        if not (OPACITY_MIN <= float(self.opacity) <= OPACITY_MAX):
+            raise ValueError(
+                f"Непрозрачность текста должна быть от {OPACITY_MIN:.2f} до {OPACITY_MAX:.2f}."
+            )
+        parse_hex_color(self.color_hex)
+
+
+@dataclass(frozen=True)
+class TextLineLayout:
+    """Single-line baseline offset and ink box relative to the annotation origin (mm)."""
+
+    text: str
+    offset_x_mm: float
+    baseline_y_mm: float
+    advance_mm: float
+    ink_left_mm: float
+    ink_top_mm: float
+    ink_right_mm: float
+    ink_bottom_mm: float
+
+
+@dataclass(frozen=True)
+class TextLayout:
+    """Backend-neutral measured text layout and rotated A4 sheet ink bounds (mm)."""
+
+    annotation: TextAnnotation
+    lines: tuple[TextLineLayout, ...]
+    line_advance_mm: float
+    ascent_mm: float
+    descent_mm: float
+    local_bounds_mm: tuple[float, float, float, float]
+    quad_mm: Quad
+    bounds_mm: tuple[float, float, float, float]
+
+
+def validate_text_bounds(layout: TextLayout) -> TextLayout:
+    """Ensure rotated text ink bounds lie inside the A4 sheet without clipping."""
+    min_x, min_y, max_x, max_y = layout.bounds_mm
+    if any(not isfinite(v) for v in (min_x, min_y, max_x, max_y)):
+        raise ValueError("Границы текстовой надписи некорректны.")
+    if min_x < -1e-6 or min_y < -1e-6 or max_x > A4_WIDTH_MM + 1e-6 or max_y > A4_HEIGHT_MM + 1e-6:
+        raise ValueError(
+            "Текст выходит за пределы листа A4. Измените положение, размер или угол поворота."
+        )
+    return layout
