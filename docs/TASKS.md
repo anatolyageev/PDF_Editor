@@ -46,7 +46,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 | `T-21` | M0 · Reliability | Extract shared safe-save and original/source identity guards | `DONE` | `T-19` |
 | `T-01` | M1 · Foundation & UX | Extract domain models from `ui/window.py` into `src/cardprint/model.py` | `DONE` | — |
 | `T-05` | M1 · Foundation & UX | Add parametric Undo/Redo for card, assignment and layout edits | `DONE` | `T-01`, `T-18` |
-| `T-20` | M1 · Foundation & UX | Track dirty workspaces and guard close/replacement against lost edits | `TODO` | `T-05` |
+| `T-20` | M1 · Foundation & UX | Track dirty workspaces and guard close/replacement against lost edits | `DONE` | `T-05` |
 | `T-02` | M1 · Foundation & UX | Add Light/Dark QSS theme system (`ui/theme.py`) and SVG icon helper (`ui/icons.py`) | `TODO` | `T-01`, `T-20` |
 | `T-03` | M1 · Foundation & UX | Add drag-and-drop import, visual Front/Back slot cards, and source badges | `TODO` | `T-02` |
 | `T-04` | M1 · Foundation & UX | Upgrade corner editor UX (mask, numbered handles, live error, loupe, shortcuts) | `TODO` | `T-02`, `T-18`, `T-19` |
@@ -224,9 +224,9 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-20`: Track dirty workspaces and guard close/replacement against lost edits
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-05`
-- **Target files:** `src/cardprint/model.py`, `src/cardprint/ui/window.py`, `tests/test_model.py`, `tests/test_ui.py`
+- **Target files:** `src/cardprint/model.py`, `src/cardprint/ui/window.py`, `scripts/gui_smoke.py`, `tests/conftest.py`, `tests/test_model.py`, `tests/test_ui.py`
 - **Goal:** Preserve edits through normal navigation and make intentional discard explicit.
 - **Acceptance criteria:**
   - Track content-based dirty checkpoints, independent last-exported PDF/PNG revisions and later project-save checkpoints. Zoom/theme/focus do not mark dirty; Undo back to a checkpoint clears the relevant dirty state.
@@ -234,7 +234,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - Side replacement/removal/reset uses Undo instead of repeated confirmation prompts. Mode switching later preserves each workspace rather than clearing it.
   - After newer edits, label Open-last-export as an earlier result. Do not describe a PDF/PNG export as saving the editable project.
   - Tests cover cancel, discard, save failure, edits during export and undo-to-checkpoint. Do not invent a project-save button before `T-16` exists.
-- **Verification:** Target model/UI tests, then the full quality gate.
+- **Verification:** `uv run pytest -q tests/test_model.py tests/test_ui.py` (24 passed, `offscreen`), `uv run pytest -q` (65 passed, `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (20 files formatted).
 
 ---
 

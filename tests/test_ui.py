@@ -13,7 +13,9 @@ from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 from cardprint.imaging import full_quad
 from cardprint.pdf_worker import PdfWorkerClient
 from cardprint.ui.editor import ImageView
-from cardprint.ui.window import InspectorDialog, MainWindow
+from cardprint.ui.window import BASE_WINDOW_TITLE, InspectorDialog, MainWindow
+
+REAL_PROMPT_UNSAVED = MainWindow._prompt_unsaved_changes
 
 
 @dataclass
@@ -866,3 +868,130 @@ def test_undo_redo_side_replacement_removal_original_guard_eviction_and_delayed_
     assert window.history.evicted_for_memory_count >= 1
     assert "истории" in window.statusBar().currentMessage().lower()
     window.close()
+
+
+def test_close_guard_cancel_discard_export_and_unavailable_export_button(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    monkeypatch.setattr(MainWindow, "_prompt_unsaved_changes", REAL_PROMPT_UNSAVED)
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+
+    # Clean/dirty state is unaffected by zoom or pan.
+    assert window.windowTitle() == f"* {BASE_WINDOW_TITLE}"
+    window.editor.zoom(1.5)
+    assert window.windowTitle() == f"* {BASE_WINDOW_TITLE}"
+
+    seen_buttons: list[list[str]] = []
+    choices = ["Отмена", "Сохранить PDF", "Сохранить PDF"]
+    chosen_btn = {}
+
+    def fake_exec(box):
+        texts = [b.text() for b in box.buttons()]
+        seen_buttons.append(texts)
+        pick = choices.pop(0)
+        for btn in box.buttons():
+            if btn.text() == pick:
+                chosen_btn[id(box)] = btn
+                break
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda box: chosen_btn.get(id(box)))
+
+    # 1. Cancel close -> stays open, work preserved.
+    window.close()
+    assert not window._closed and not window._closing
+    assert "front" in window.cards
+    assert "Сохранить PDF" in seen_buttons[-1]
+
+    # 2. When export is unavailable (invalid selection), Save PDF is omitted from dialog.
+    window.selection_changed(((10, 10), (800, 500), (800, 10), (10, 500)))
+    controller.drain()
+    assert not window.can_export_now()
+    box_no_export, _, export_btn, _ = window._build_unsaved_dialog(
+        can_export=window.can_export_now()
+    )
+    assert export_btn is None
+    assert "Сохранить PDF" not in [b.text() for b in box_no_export.buttons()]
+    box_no_export.deleteLater()
+
+    # Restore valid selection.
+    window.undo()
+    controller.drain()
+    assert window.can_export_now()
+
+    # 3. Choose Save PDF from close dialog, then cancel file dialog -> stays open and dirty.
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kw: ("", ""))
+    window.close()
+    assert not window._closed and not window._closing
+    assert window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
+
+    # 4. Choose Save PDF from close dialog and save -> exports and closes cleanly.
+    out_pdf = tmp_path / "saved_on_close.pdf"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, p=out_pdf, **kw: (str(p), ""))
+    window.close()
+    controller.drain()
+    assert out_pdf.exists()
+    assert window._closed
+
+    # 5. Discard on second window closes without exporting.
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    window2, _ = _setup_front_with_controller(qtbot, sub, synthetic_card)
+    choices[:] = ["Выйти без сохранения"]
+    window2.close()
+    assert window2._closed
+
+
+def test_dirty_state_save_failure_edits_during_export_and_undo_to_checkpoint(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    monkeypatch.setattr(MainWindow, "_prompt_unsaved_changes", REAL_PROMPT_UNSAVED)
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    monkeypatch.setattr(
+        QMessageBox,
+        "exec",
+        lambda _box: (_ for _ in ()).throw(
+            AssertionError("Close prompt must not appear when clean")
+        ),
+    )
+
+    out_pdf = tmp_path / "out.pdf"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, p=out_pdf, **kw: (str(p), ""))
+
+    # 1. Failed export keeps dirty state and does not mark exported.
+    assert window.save("pdf")
+    assert len(controller.pending) == 1
+    controller.fail_at(0, "Ошибка записи")
+    assert errors and "Ошибка записи" in errors[-1]
+    assert window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
+    assert "pdf" not in window.last_exported_revisions
+
+    # 2. Edits made while export is in flight: export acknowledges only captured snapshot S1.
+    s1 = window.current_workspace_snapshot()
+    assert window.save("pdf")
+    assert len(controller.pending) == 1
+    window.radius.setValue(5)
+    controller.complete_at(0)  # Complete export of S1 while radius=5 render is still pending
+    controller.drain()
+
+    assert window.checkpoints.exports["pdf"].snapshot == s1
+    assert window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
+    assert window.windowTitle() == f"* {BASE_WINDOW_TITLE}"
+    assert window.open_button.isVisible()
+    assert window.open_button.text() == "Открыть ранний экспорт"
+    assert "ранней" in window.export_message.text().lower()
+    assert "не сохраняет редактируемый проект" in window.export_message.text().lower()
+
+    # 3. Undoing back to S1 clears dirty state and restores current-export labelling.
+    window.undo()
+    controller.drain()
+    assert not window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
+    assert window.windowTitle() == BASE_WINDOW_TITLE
+    assert window.open_button.text() == "Открыть сохранённый файл"
+
+    # 4. Closing clean window does not invoke close prompt.
+    window.close()
+    assert window._closed

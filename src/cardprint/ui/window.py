@@ -51,7 +51,7 @@ from ..imaging import (
     rotated,
     round_corners,
 )
-from ..model import SIDE_NAMES, Card, UndoStack, WorkspaceSnapshot
+from ..model import SIDE_NAMES, Card, UndoStack, WorkspaceCheckpoints, WorkspaceSnapshot
 from ..pdf_worker import (
     DEFAULT_THUMBNAIL_BATCH_SIZE,
     PDF_DPI,
@@ -64,6 +64,8 @@ from ..pdf_worker import (
 )
 from .editor import CORNER_LABELS, ImageView, pixmap, to_qimage
 from .tasks import PdfTaskBridge, Task, dispatch_pdf_request
+
+BASE_WINDOW_TITLE = "Карточки на A4 · локальная подготовка к печати"
 
 
 class InspectorDialog(QDialog):
@@ -142,7 +144,7 @@ def thumbnail(image, limit=2000):
 class MainWindow(QMainWindow):
     def __init__(self, pdf_worker: PdfWorkerClient | None = None):
         super().__init__()
-        self.setWindowTitle("Карточки на A4 · локальная подготовка к печати")
+        self.setWindowTitle(BASE_WINDOW_TITLE)
         self.resize(1380, 880)
         self.cards: dict[str, Card] = {}
         self.active_side = "front"
@@ -152,6 +154,7 @@ class MainWindow(QMainWindow):
         self.session_id = 1
         self._card_revision_seq = 0
         self.history = UndoStack(WorkspaceSnapshot((), Layout()))
+        self.checkpoints = WorkspaceCheckpoints(self.history.current)
         self.load_generation = {"front": 0, "back": 0}
         self.inspector_request_id = {"front": 0, "back": 0}
         self.inspectors: list[InspectorDialog] = []
@@ -169,6 +172,8 @@ class MainWindow(QMainWindow):
         self.syncing = False
         self._closing = False
         self._closed = False
+        self._pending_close_after_export = False
+        self._discard_confirmed = False
         self._build_ui()
         self.layout_timer = QTimer(self)
         self.layout_timer.setSingleShot(True)
@@ -179,6 +184,7 @@ class MainWindow(QMainWindow):
         )
         self._sync_controls()
         self._sync_history_controls()
+        self._sync_dirty_ui()
         self.invalidate_sheet("Назначьте стороны документа.")
         self.preview.set_image(Image.new("RGB", (420, 594), "white"))
 
@@ -1102,6 +1108,7 @@ class MainWindow(QMainWindow):
         snap = WorkspaceSnapshot.from_state(self.cards, self.current_layout())
         result = self.history.push(snap, label)
         self._sync_history_controls()
+        self._sync_dirty_ui()
         if result.evicted > 0:
             if result.evicted_for_memory > 0:
                 self.statusBar().showMessage(
@@ -1177,6 +1184,7 @@ class MainWindow(QMainWindow):
         self.refresh_inspectors()
         self.show_card()
         self._sync_history_controls()
+        self._sync_dirty_ui()
         self.statusBar().showMessage(status_message)
         if self.cards:
             for side, card in self.cards.items():
@@ -1336,13 +1344,76 @@ class MainWindow(QMainWindow):
                     f"Снимок устарел: параметры стороны изменены (правка #{current.revision})."
                 )
 
-    def save(self, kind):
+    def current_workspace_snapshot(self) -> WorkspaceSnapshot:
+        return WorkspaceSnapshot.from_state(self.cards, self.current_layout())
+
+    def can_export_now(self) -> bool:
+        return bool(self.sheet is not None and not self.is_drafting() and not self.pending_loads)
+
+    def _sync_dirty_ui(self):
+        snap = self.current_workspace_snapshot()
+        dirty = self.checkpoints.needs_close_confirmation(snap)
+        self.setWindowTitle(f"* {BASE_WINDOW_TITLE}" if dirty else BASE_WINDOW_TITLE)
+        record = self.checkpoints.last_export_record()
+        if record is not None and self.export_path is not None:
+            self.open_button.show()
+            if self.checkpoints.is_last_export_stale(snap):
+                self.open_button.setText("Открыть ранний экспорт")
+                self.open_button.setToolTip(
+                    f"Открыть более ранний результат ({self.export_path.name}); "
+                    "после него были внесены правки."
+                )
+                self.export_message.setText(
+                    f"Последний экспорт ({self.export_path.name}) относится к более ранней "
+                    f"правке и не сохраняет редактируемый проект.\n\n{PRINT_HINT}"
+                )
+            else:
+                self.open_button.setText("Открыть сохранённый файл")
+                self.open_button.setToolTip(f"Открыть {self.export_path.name}")
+                self.export_message.setText(
+                    f"Экспортировано: {self.export_path.name} "
+                    f"(экспорт не сохраняет редактируемый проект).\n\n{PRINT_HINT}"
+                )
+
+    def _build_unsaved_dialog(self, *, can_export: bool):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Есть неэкспортированные изменения")
+        box.setText("Текущие правки ещё не экспортированы в PDF или PNG.")
+        box.setInformativeText("При закрытии окна неэкспортированные изменения будут потеряны.")
+        discard_btn = box.addButton("Выйти без сохранения", QMessageBox.ButtonRole.DestructiveRole)
+        export_btn = (
+            box.addButton("Сохранить PDF", QMessageBox.ButtonRole.AcceptRole)
+            if can_export
+            else None
+        )
+        cancel_btn = box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setEscapeButton(cancel_btn)
+        box.setDefaultButton(export_btn or cancel_btn)
+        return box, discard_btn, export_btn, cancel_btn
+
+    def _prompt_unsaved_changes(self, *, can_export: bool) -> str:
+        box, discard_btn, export_btn, _cancel_btn = self._build_unsaved_dialog(
+            can_export=can_export
+        )
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is discard_btn:
+            return "discard"
+        if export_btn is not None and clicked is export_btn:
+            return "export_pdf"
+        return "cancel"
+
+    def save(self, kind, *, close_on_success: bool = False) -> bool:
         if self.is_drafting():
+            self._pending_close_after_export = False
             self.show_error("Завершите выделение или нажмите Esc для отмены перед экспортом.")
-            return
+            return False
         if self.sheet is None:
+            self._pending_close_after_export = False
             self.show_error("Дождитесь обработки и исправьте выделение или компоновку.")
-            return
+            return False
+        captured_snapshot = self.current_workspace_snapshot()
         revisions = tuple(sorted((side, card.revision) for side, card in self.cards.items()))
         source_fps = tuple(
             card.source.fingerprint
@@ -1353,8 +1424,9 @@ class MainWindow(QMainWindow):
             try:
                 self.original_guard.validate_source(fp.path, expected=fp)
             except SourceChangedError as exc:
+                self._pending_close_after_export = False
                 self.show_error(str(exc))
-                return
+                return False
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить лист A4",
@@ -1363,7 +1435,8 @@ class MainWindow(QMainWindow):
             options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if not path:
-            return
+            self._pending_close_after_export = False
+            return False
         target = Path(path)
         if target.suffix.lower() != f".{kind}":
             target = target.with_suffix(f".{kind}")
@@ -1372,8 +1445,9 @@ class MainWindow(QMainWindow):
         try:
             self.original_guard.assert_not_protected(target)
         except OriginalOverwriteError as exc:
+            self._pending_close_after_export = False
             self.show_error(str(exc))
-            return
+            return False
         overwrite = target.exists()
         if overwrite:
             answer = QMessageBox.question(
@@ -1384,18 +1458,29 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
-                return
+                self._pending_close_after_export = False
+                return False
         snap = snapshot_sheet(self.sheet, revisions=revisions, source_fingerprints=source_fps)
         frozen_sheet = Sheet(dict(snap.images), list(snap.placements))
+        self._pending_close_after_export = close_on_success
 
         def done(_):
             if self._closing or self._closed:
                 return
+            self.checkpoints.mark_exported(kind, captured_snapshot, snap.revisions, target)
             self.last_exported_revisions[kind] = snap.revisions
             self.export_path = target
-            self.open_button.show()
-            self.export_message.setText(f"Сохранено: {target.name}\n\n{PRINT_HINT}")
+            self._sync_dirty_ui()
             self.statusBar().showMessage(f"Сохранено: {target}")
+            if self._pending_close_after_export:
+                self._pending_close_after_export = False
+                if not self.checkpoints.needs_close_confirmation(self.current_workspace_snapshot()):
+                    self.close()
+
+        def failed(message):
+            self._pending_close_after_export = False
+            if not (self._closing or self._closed):
+                self.show_error(message)
 
         self.submit(
             lambda: export_sheet(
@@ -1408,7 +1493,9 @@ class MainWindow(QMainWindow):
                 source_fingerprints=snap.source_fingerprints,
             ),
             done,
+            failed,
         )
+        return True
 
     def open_export(self):
         if self.export_path and not QDesktopServices.openUrl(
@@ -1420,6 +1507,21 @@ class MainWindow(QMainWindow):
         if self._closed:
             event.accept()
             return
+        if (
+            not self._closing
+            and not self._discard_confirmed
+            and self.checkpoints.needs_close_confirmation(self.current_workspace_snapshot())
+        ):
+            choice = self._prompt_unsaved_changes(can_export=self.can_export_now())
+            if choice == "cancel":
+                event.ignore()
+                return
+            if choice == "export_pdf":
+                event.ignore()
+                self.save("pdf", close_on_success=True)
+                return
+            if choice == "discard":
+                self._discard_confirmed = True
         self.layout_timer.stop()
         self._clear_draft()
         self.pdf_worker.cancel_pending(keep_exports=True)

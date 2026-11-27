@@ -136,22 +136,40 @@ and added export support for filesystems without hard links.
 - Next ready task in [TASKS.md](TASKS.md): `T-20` (dirty workspace tracking and
   close/replacement loss guards).
 
+### `T-20` (2026-11-27) — Dirty workspace checkpoints & close guard
+
+- Added `ExportRecord` and `WorkspaceCheckpoints` in `src/cardprint/model.py`
+  tracking content-based checkpoints independently for PDF exports, PNG exports,
+  and future project saves (`T-16`).
+- Integrated dirty window-title indicator (`* …`), close confirmation dialog
+  (`_build_unsaved_dialog` / `_prompt_unsaved_changes` offering «Выйти без
+  сохранения», «Сохранить PDF» when exportable, and «Отмена»), captured-revision
+  acknowledgment on pending export completion, failure/cancel preservation of dirty
+  state, and «Открыть ранний экспорт» labelling after subsequent edits in
+  `src/cardprint/ui/window.py` (plus explicit non-interactive discard in
+  `scripts/gui_smoke.py` and `tests/conftest.py`).
+- Added unit and deterministic UI tests in `tests/test_model.py` and
+  `tests/test_ui.py` covering cancel, discard, unavailable-export close prompt,
+  save cancellation/failure, edits during in-flight export, and undo-to-checkpoint.
+- Next ready task in [TASKS.md](TASKS.md): `T-02` (Light/Dark QSS theme system
+  and SVG icon helper).
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-05` on 2026-11-27**
+The following results were obtained **after completing `T-20` on 2026-11-27**
 (Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows
 and macOS remain unverified):
 
 | Check | Result and scope |
 | --- | --- |
-| `uv run pytest -q tests/test_model.py tests/test_ui.py` | **21 passed** (`8.91s`), Qt `offscreen`. |
-| `uv run pytest -q` | **62 passed** (`15.19s`), including 14 Qt `offscreen` UI tests and 7 `model.py` tests. |
+| `uv run pytest -q tests/test_model.py tests/test_ui.py` | **24 passed** (`10.67s`), Qt `offscreen`. |
+| `uv run pytest -q` | **65 passed** (`15.39s`), including 16 Qt `offscreen` UI tests and 8 `model.py` tests. |
 | `uv run ruff check src tests scripts` | All checks passed. |
 | `uv run ruff format --check src tests scripts` | 20 files already formatted. |
 
-`gui_smoke.py` was not rerun for `T-05`; its latest recorded run remains from `T-19` on 2026-11-27.
+`gui_smoke.py` was not rerun for `T-20`; its latest recorded run remains from `T-19` on 2026-11-27.
 
-Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-05`):
+Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-20`):
 
 | Check | Result and scope |
 | --- | --- |

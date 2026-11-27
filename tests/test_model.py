@@ -158,3 +158,41 @@ def test_undo_stack_enforces_entry_cap_and_history_only_byte_budget(tmp_path):
     assert res_c.evicted_for_memory >= 1
     assert stack.history_only_bytes <= 50_000
     assert stack.evicted_for_memory_count >= 1
+
+
+def test_workspace_checkpoints_independent_exports_project_and_undo_to_checkpoint(tmp_path):
+    initial = model.WorkspaceSnapshot((), Layout())
+    checkpoints = model.WorkspaceCheckpoints(initial)
+    assert not checkpoints.needs_close_confirmation(initial)
+    assert not checkpoints.is_project_dirty(initial)
+    assert not checkpoints.is_last_export_stale(initial)
+
+    card = _make_card(tmp_path, "front.png")
+    s1 = model.WorkspaceSnapshot.from_state({"front": card}, Layout())
+    assert checkpoints.needs_close_confirmation(s1)
+    assert checkpoints.is_project_dirty(s1)
+
+    # Exporting PDF clears close confirmation for S1, leaves PNG unexported and project dirty.
+    pdf_path = tmp_path / "sheet.pdf"
+    checkpoints.mark_exported("pdf", s1, (("front", 1),), pdf_path)
+    assert checkpoints.is_export_current("pdf", s1)
+    assert not checkpoints.is_export_current("png", s1)
+    assert checkpoints.is_project_dirty(s1)
+    assert not checkpoints.needs_close_confirmation(s1)
+    assert not checkpoints.is_last_export_stale(s1)
+
+    # Making a newer edit S2 marks export stale and close dirty again.
+    card.radius = 5.0
+    s2 = model.WorkspaceSnapshot.from_state({"front": card}, Layout())
+    assert checkpoints.is_last_export_stale(s2)
+    assert checkpoints.needs_close_confirmation(s2)
+
+    # Undoing back to S1 clears close confirmation and stale export status.
+    assert not checkpoints.is_last_export_stale(s1)
+    assert not checkpoints.needs_close_confirmation(s1)
+
+    # Saving project at S2 clears project dirty and close guard independently of PDF export.
+    checkpoints.mark_project_saved(s2)
+    assert not checkpoints.is_project_dirty(s2)
+    assert not checkpoints.needs_close_confirmation(s2)
+    assert not checkpoints.is_export_current("pdf", s2)

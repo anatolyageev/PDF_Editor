@@ -22,7 +22,7 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [pdf_worker.py](../src/cardprint/pdf_worker.py) | Single spawned PyMuPDF child process, serializable IPC requests/results, request coalescing, crash recovery, and byte-bounded `ByteLRUCache` (32 MiB thumbnails / 128 MiB display pages). No Qt dependency. |
 | [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, batched PDF discovery via `pdf_worker`, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt or top-level PyMuPDF dependency. |
 | [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, and arrange. Independent of the UI. |
-| [model.py](../src/cardprint/model.py) | Pure-Python domain models (`Card`, `SIDE_NAMES`) and memory-bounded parametric `UndoStack` (`CardSnapshot`, `WorkspaceSnapshot`). No Qt dependency. |
+| [model.py](../src/cardprint/model.py) | Pure-Python domain models (`Card`, `SIDE_NAMES`), memory-bounded parametric `UndoStack` (`CardSnapshot`, `WorkspaceSnapshot`), and `WorkspaceCheckpoints` (`ExportRecord`). No Qt dependency. |
 | [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output, and staged PDF/PNG validation. No Qt dependency. |
 | [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, zoom, and pan. |
 | [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, side assignments, settings, task coordination, and export actions. |
@@ -163,9 +163,14 @@ atomically during copying. An unexpected OS process crash can still leave a
 `Source` carries a `SourceFingerprint` recorded at discovery. Reopening a source in
 `load_source`, `assign_selected`, or `export_sheet` revalidates the file on disk and
 blocks processing/export with `SourceChangedError` if it changed or moved until the
-user reloads it explicitly («Перезагрузить выбранный файл»). `MainWindow.save`
-captures an immutable `ExportSnapshot` (`snapshot_sheet`) and records
-`last_exported_revisions` only upon successful completion.
+user reloads it explicitly («Перезагрузить выбранный файл»). `MainWindow.save` captures an immutable `ExportSnapshot` (`snapshot_sheet`) and
+`captured_snapshot` (`WorkspaceSnapshot`), recording `last_exported_revisions` and
+`WorkspaceCheckpoints.mark_exported` only upon successful completion. Failed or
+cancelled exports leave dirty state intact, edits made while an export runs leave the
+workspace dirty with the open button relabelled as an earlier export, and
+`MainWindow.closeEvent` prompts before discarding unexported edits (offering cancel,
+discard, or saving PDF when exportable). Zoom, pan, and focus do not affect
+checkpoints, and undoing back to a matching checkpoint clears the dirty indicator.
 
 ## Extension points
 

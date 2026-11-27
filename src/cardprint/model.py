@@ -1,6 +1,7 @@
 """Pure-Python domain models and memory-bounded parametric Undo/Redo (no Qt dependency)."""
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -223,3 +224,73 @@ class UndoStack:
             return None
         self._cursor += 1
         return self.current, self._entries[self._cursor].label
+
+
+@dataclass(frozen=True)
+class ExportRecord:
+    """Tracks a completed PDF or PNG export independently of editable project state."""
+
+    kind: str
+    snapshot: WorkspaceSnapshot
+    revisions: tuple[tuple[str, int], ...] = ()
+    target: Path | None = None
+
+
+class WorkspaceCheckpoints:
+    """Content-based dirty tracking separating exports from future project saves."""
+
+    def __init__(self, initial: WorkspaceSnapshot | None = None):
+        self.initial_snapshot: WorkspaceSnapshot = (
+            initial if initial is not None else WorkspaceSnapshot()
+        )
+        self.project_checkpoint: WorkspaceSnapshot | None = None
+        self.exports: dict[str, ExportRecord] = {}
+        self.last_export_kind: str | None = None
+
+    def mark_exported(
+        self,
+        kind: str,
+        snapshot: WorkspaceSnapshot,
+        revisions: tuple[tuple[str, int], ...] = (),
+        target: Path | None = None,
+    ) -> None:
+        self.exports[kind] = ExportRecord(
+            kind=kind, snapshot=snapshot, revisions=revisions, target=target
+        )
+        self.last_export_kind = kind
+
+    def mark_project_saved(self, snapshot: WorkspaceSnapshot) -> None:
+        self.project_checkpoint = snapshot
+
+    def is_project_dirty(self, current: WorkspaceSnapshot) -> bool:
+        baseline = (
+            self.project_checkpoint
+            if self.project_checkpoint is not None
+            else self.initial_snapshot
+        )
+        return current != baseline
+
+    def is_export_current(self, kind: str, current: WorkspaceSnapshot) -> bool:
+        record = self.exports.get(kind)
+        return record is not None and current == record.snapshot
+
+    def is_any_export_current(self, current: WorkspaceSnapshot) -> bool:
+        return any(current == record.snapshot for record in self.exports.values())
+
+    def last_export_record(self) -> ExportRecord | None:
+        if self.last_export_kind is None:
+            return None
+        return self.exports.get(self.last_export_kind)
+
+    def is_last_export_stale(self, current: WorkspaceSnapshot) -> bool:
+        record = self.last_export_record()
+        return record is not None and current != record.snapshot
+
+    def needs_close_confirmation(self, current: WorkspaceSnapshot) -> bool:
+        if current == self.initial_snapshot:
+            return False
+        if self.project_checkpoint is not None and current == self.project_checkpoint:
+            return False
+        if self.is_any_export_current(current):
+            return False
+        return True

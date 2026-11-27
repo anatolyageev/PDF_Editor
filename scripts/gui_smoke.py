@@ -80,6 +80,7 @@ def main() -> int:
                 failed = True
             print(f"GUI smoke {'FAILED' if failed else 'passed'}: {output.resolve()}")
             timer.stop()
+            window._discard_confirmed = True
             window.close()
             app.quit()
 

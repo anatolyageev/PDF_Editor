@@ -9,6 +9,14 @@ from PIL import Image, ImageDraw
 
 from cardprint.export import reset_default_original_guard
 from cardprint.pdf_worker import shutdown_default_pdf_worker
+from cardprint.ui.window import MainWindow
+
+
+@pytest.fixture(autouse=True)
+def bypass_unsaved_close_prompt(monkeypatch):
+    monkeypatch.setattr(
+        MainWindow, "_prompt_unsaved_changes", lambda self, *, can_export=False: "discard"
+    )
 
 
 @pytest.fixture(autouse=True)
