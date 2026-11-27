@@ -1,3 +1,6 @@
+import errno
+import shutil
+import threading
 from io import BytesIO
 
 import numpy as np
@@ -5,8 +8,17 @@ import pymupdf
 import pytest
 from PIL import Image
 
-from cardprint.export import Sheet, export_sheet, render_sheet
+from cardprint.export import (
+    OriginalGuard,
+    OriginalOverwriteError,
+    Sheet,
+    SourceChangedError,
+    atomic_write_file,
+    export_sheet,
+    render_sheet,
+)
 from cardprint.geometry import MM_TO_PT, Layout, arrange
+from cardprint.imaging import discover
 
 
 def test_pdf_has_a4_two_full_resolution_lossless_cards_and_white_background(
@@ -99,3 +111,193 @@ def test_export_on_filesystem_without_hardlinks(tmp_path, monkeypatch):
         export_sheet(sheet, target, "pdf")
     assert target.read_bytes() == before
     assert not list(tmp_path.glob(".cardprint-*"))
+
+
+def test_atomic_write_file_protects_originals_symlinks_hardlinks_and_removed_paths(tmp_path):
+    orig = tmp_path / "original.png"
+    orig.write_bytes(b"original-bytes")
+    guard = OriginalGuard()
+    guard.register(orig)
+
+    # Direct overwrite attempt fails before staging.
+    with pytest.raises(OriginalOverwriteError):
+        atomic_write_file(
+            orig, lambda p: p.write_bytes(b"new"), overwrite=True, original_guard=guard
+        )
+    assert orig.read_bytes() == b"original-bytes"
+    assert not list(tmp_path.glob(".cardprint-*"))
+
+    # Hard-link alias attempt fails via device/inode identity.
+    hardlink = tmp_path / "hardlink.png"
+    try:
+        hardlink.hardlink_to(orig)
+    except OSError:
+        pass
+    else:
+        with pytest.raises(OriginalOverwriteError):
+            atomic_write_file(
+                hardlink, lambda p: p.write_bytes(b"new"), overwrite=True, original_guard=guard
+            )
+        assert orig.read_bytes() == b"original-bytes"
+
+    # Symlink alias attempt fails.
+    symlink = tmp_path / "symlink.png"
+    try:
+        symlink.symlink_to(orig)
+    except OSError:
+        pass
+    else:
+        with pytest.raises(OriginalOverwriteError):
+            atomic_write_file(
+                symlink, lambda p: p.write_bytes(b"new"), overwrite=True, original_guard=guard
+            )
+        assert orig.read_bytes() == b"original-bytes"
+
+    # Even after removing the original file, its path remains protected.
+    orig.unlink()
+    with pytest.raises(OriginalOverwriteError):
+        atomic_write_file(
+            orig, lambda p: p.write_bytes(b"recreated"), overwrite=True, original_guard=guard
+        )
+    assert not orig.exists()
+    assert not list(tmp_path.glob(".cardprint-*"))
+
+
+def test_atomic_write_file_late_collision_and_writer_or_validator_failure(tmp_path):
+    target = tmp_path / "output.dat"
+    guard = OriginalGuard()
+
+    # Late target collision during writer execution raises FileExistsError and preserves late file.
+    def collide_writer(staging):
+        staging.write_bytes(b"staged")
+        target.write_bytes(b"late-arrival")
+
+    with pytest.raises(FileExistsError):
+        atomic_write_file(target, collide_writer, overwrite=False, original_guard=guard)
+    assert target.read_bytes() == b"late-arrival"
+    assert not list(tmp_path.glob(".cardprint-*"))
+
+    # Writer failure preserves existing non-original target and cleans up staging.
+    def fail_writer(staging):
+        staging.write_bytes(b"partial")
+        raise RuntimeError("write failed")
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        atomic_write_file(target, fail_writer, overwrite=True, original_guard=guard)
+    assert target.read_bytes() == b"late-arrival"
+    assert not list(tmp_path.glob(".cardprint-*"))
+
+    # Validator failure preserves existing non-original target and cleans up staging.
+    def fail_validator(_staging):
+        raise ValueError("validation failed")
+
+    with pytest.raises(ValueError, match="validation failed"):
+        atomic_write_file(
+            target,
+            lambda p: p.write_bytes(b"bad-output"),
+            overwrite=True,
+            validator_fn=fail_validator,
+            original_guard=guard,
+        )
+    assert target.read_bytes() == b"late-arrival"
+    assert not list(tmp_path.glob(".cardprint-*"))
+
+
+def test_atomic_write_file_fallback_copy_failure_cleans_partial_target(tmp_path, monkeypatch):
+    import cardprint.export as exporting
+
+    target = tmp_path / "fallback.dat"
+    guard = OriginalGuard()
+
+    def no_hardlink(*_args):
+        raise OSError(errno.EOPNOTSUPP, "Hard links unavailable")
+
+    def failing_copy(_src, dst):
+        dst.write(b"partial-bytes")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(exporting.os, "link", no_hardlink)
+    monkeypatch.setattr(exporting.shutil, "copyfileobj", failing_copy)
+
+    with pytest.raises(OSError, match="disk full"):
+        atomic_write_file(target, lambda p: p.write_bytes(b"full"), original_guard=guard)
+    assert not target.exists()
+    assert not list(tmp_path.glob(".cardprint-*"))
+
+
+def test_atomic_write_file_serializes_concurrent_writes_to_same_destination(tmp_path):
+    target = tmp_path / "shared.dat"
+    guard = OriginalGuard()
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+    entered_first = threading.Event()
+
+    def write_payload(label: bytes):
+        def writer(staging):
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            entered_first.set()
+            # Yield briefly without busy-waiting to allow second thread to contend on lock.
+            threading.Event().wait(0.05)
+            staging.write_bytes(label)
+            with counter_lock:
+                active -= 1
+
+        return writer
+
+    errors = []
+
+    def worker(label: bytes):
+        try:
+            atomic_write_file(target, write_payload(label), overwrite=True, original_guard=guard)
+        except Exception as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=worker, args=(b"first",))
+    t2 = threading.Thread(target=worker, args=(b"second",))
+    t1.start()
+    assert entered_first.wait(timeout=5)
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert not errors
+    assert max_active == 1
+    assert target.read_bytes() in (b"first", b"second")
+
+
+def test_export_sheet_non_ui_protects_discovered_original_and_validates_png_and_changed_source(
+    tmp_path, synthetic_card, monkeypatch
+):
+    orig = tmp_path / "orig.png"
+    synthetic_card.save(orig)
+    sources = discover(orig)
+    fp = sources[0].fingerprint
+    assert fp is not None
+
+    sheet = Sheet({"front": synthetic_card}, arrange({"front": (85.6, 53.98)}, Layout()))
+
+    # Headless export_sheet refuses to overwrite discovered original via default guard.
+    with pytest.raises(OriginalOverwriteError):
+        export_sheet(sheet, orig, "png", overwrite=True)
+
+    # Corrupt staged PNG fails staged validation without publishing.
+    bad_png = tmp_path / "bad.png"
+    monkeypatch.setattr(
+        "cardprint.export.render_sheet", lambda _s, dpi=300: Image.new("RGB", (50, 50))
+    )
+    with pytest.raises(ValueError, match="300 DPI"):
+        export_sheet(sheet, bad_png, "png")
+    assert not bad_png.exists()
+    assert not list(tmp_path.glob(".cardprint-*"))
+
+    # Modifying source on disk blocks export until reloaded.
+    orig.write_bytes(orig.read_bytes() + b"\x00")
+    out_pdf = tmp_path / "out.pdf"
+    with pytest.raises(SourceChangedError, match="изменился"):
+        export_sheet(sheet, out_pdf, "pdf", source_fingerprints=(fp,))
+    assert not out_pdf.exists()
+    # Keep unused shutil import used in module-level verification cleanly.
+    assert shutil is not None

@@ -7,7 +7,15 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
+from cardprint.export import reset_default_original_guard
 from cardprint.pdf_worker import shutdown_default_pdf_worker
+
+
+@pytest.fixture(autouse=True)
+def isolate_default_original_guard():
+    reset_default_original_guard()
+    yield
+    reset_default_original_guard()
 
 
 @pytest.fixture(scope="session", autouse=True)

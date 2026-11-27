@@ -30,7 +30,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..export import PRINT_HINT, Sheet, export_sheet, render_sheet
+from ..export import (
+    PRINT_HINT,
+    OriginalGuard,
+    OriginalOverwriteError,
+    Sheet,
+    SourceChangedError,
+    export_sheet,
+    fingerprint_file,
+    render_sheet,
+    snapshot_sheet,
+)
 from ..geometry import CardSize, Layout, arrange, validate_quad
 from ..imaging import (
     Source,
@@ -173,6 +183,8 @@ class MainWindow(QMainWindow):
         self.tasks = {}
         self.pending_loads = set()
         self.original_paths = set()
+        self.original_guard = OriginalGuard()
+        self.last_exported_revisions: dict[str, tuple[tuple[str, int], ...]] = {}
         self._owns_pdf_worker = pdf_worker is None
         self.pdf_worker = pdf_worker or PdfWorkerClient()
         self.pool = QThreadPool(self)
@@ -233,6 +245,10 @@ class MainWindow(QMainWindow):
             self.button("Назначить обратной", lambda: self.assign_selected("back"))
         )
         left_layout.addWidget(self.button("Убрать выбранный файл", self.remove_source))
+        self.reload_source_button = self.button(
+            "Перезагрузить выбранный файл", self.reload_selected_source
+        )
+        left_layout.addWidget(self.reload_source_button)
         splitter.addWidget(left)
 
         self.tabs = QTabWidget()
@@ -438,6 +454,11 @@ class MainWindow(QMainWindow):
 
     def _append_sources(self, sources: list[Source]) -> int:
         self.original_paths.update(source.path for source in sources)
+        for source in sources:
+            if source.fingerprint is not None:
+                self.original_guard.record_fingerprint(source.fingerprint)
+            else:
+                self.original_guard.register(source.path)
         existing = {
             (
                 self.sources.item(i).data(Qt.ItemDataRole.UserRole).path,
@@ -464,6 +485,7 @@ class MainWindow(QMainWindow):
         if self._closing or self._closed:
             return
         self.original_paths.update(Path(path).resolve() for path in paths)
+        self.original_guard.register_many(paths)
         pdf_paths = [Path(path).resolve() for path in paths if Path(path).suffix.lower() == ".pdf"]
         other_paths = [path for path in paths if Path(path).suffix.lower() != ".pdf"]
 
@@ -473,7 +495,7 @@ class MainWindow(QMainWindow):
                 sources, errors = [], []
                 for path in other_paths:
                     try:
-                        sources.extend(discover(path))
+                        sources.extend(discover(path, original_guard=self.original_guard))
                     except Exception as exc:
                         errors.append(f"{Path(path).name}: {exc}")
                 return sources, errors
@@ -497,7 +519,16 @@ class MainWindow(QMainWindow):
             for pdf_path in pdf_paths:
                 self._import_pdf_batched(pdf_path, import_gen)
 
-    def _import_pdf_batched(self, pdf_path: Path, import_gen: int) -> None:
+    def _import_pdf_batched(
+        self, pdf_path: Path, import_gen: int, *, on_source_loaded=None
+    ) -> None:
+        try:
+            fp = fingerprint_file(pdf_path)
+        except ValueError as exc:
+            self.show_error(f"{pdf_path.name}: {exc}")
+            return
+        self.original_guard.record_fingerprint(fp)
+
         def request_batch(start_page: int) -> None:
             if self._closing or self._closed:
                 return
@@ -506,10 +537,13 @@ class MainWindow(QMainWindow):
                 if self._closing or self._closed:
                     return
                 sources = [
-                    Source(Path(batch.path), page_idx, img.to_pil())
+                    Source(Path(batch.path), page_idx, img.to_pil(), fingerprint=fp)
                     for page_idx, img in batch.items
                 ]
                 self._append_sources(sources)
+                if on_source_loaded is not None:
+                    for src in sources:
+                        on_source_loaded(src)
                 next_start = batch.items[-1][0] + 1 if batch.items else batch.total_pages
                 if next_start < batch.total_pages:
                     self.statusBar().showMessage(
@@ -540,6 +574,7 @@ class MainWindow(QMainWindow):
             if self._closing or self._closed:
                 return
             self.original_paths.add(Path(info.path))
+            self.original_guard.register(info.path)
             request_batch(0)
 
         def on_inspect_error(message: str) -> None:
@@ -551,6 +586,65 @@ class MainWindow(QMainWindow):
             on_inspected,
             on_inspect_error,
         )
+
+    def reload_selected_source(self):
+        if self._closing or self._closed:
+            return
+        item = self.sources.currentItem()
+        if item is None:
+            self.statusBar().showMessage("Сначала выберите файл или страницу слева.")
+            return
+        selected_source: Source = item.data(Qt.ItemDataRole.UserRole)
+        target_path = selected_source.path.resolve()
+        try:
+            fp = fingerprint_file(target_path)
+        except ValueError as exc:
+            self.show_error(str(exc))
+            return
+        self.original_guard.record_fingerprint(fp)
+        affected_sides = [
+            (side, card.source.page)
+            for side, card in self.cards.items()
+            if card.source.path.resolve() == target_path
+        ]
+
+        if selected_source.page is None:
+
+            def work():
+                return discover(target_path, original_guard=self.original_guard)
+
+            def done(sources):
+                if self._closing or self._closed or not sources:
+                    return
+                new_source = sources[0]
+                for i in range(self.sources.count()):
+                    row_item = self.sources.item(i)
+                    row_src = row_item.data(Qt.ItemDataRole.UserRole)
+                    if row_src.path.resolve() == target_path and row_src.page is None:
+                        row_item.setData(Qt.ItemDataRole.UserRole, new_source)
+                        row_item.setIcon(QIcon(pixmap(new_source.thumbnail)))
+                for side, _ in affected_sides:
+                    self._load_source_for_side(side, new_source)
+                self.statusBar().showMessage(f"Файл перезагружен: {target_path.name}")
+
+            self.submit(work, done)
+        else:
+            for i in range(self.sources.count() - 1, -1, -1):
+                if (
+                    self.sources.item(i).data(Qt.ItemDataRole.UserRole).path.resolve()
+                    == target_path
+                ):
+                    self.sources.takeItem(i)
+            self.import_generation += 1
+
+            def on_pdf_source(reloaded_src: Source):
+                for side, expected_page in affected_sides:
+                    if reloaded_src.page == expected_page:
+                        self._load_source_for_side(side, reloaded_src)
+
+            self._import_pdf_batched(
+                target_path, self.import_generation, on_source_loaded=on_pdf_source
+            )
 
     def assign_next(self, _item=None):
         self.assign_selected(
@@ -565,6 +659,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Сначала выберите файл или страницу слева.")
             return
         source = item.data(Qt.ItemDataRole.UserRole)
+        if source.fingerprint is not None:
+            try:
+                self.original_guard.validate_source(source.path, expected=source.fingerprint)
+            except SourceChangedError as exc:
+                self.show_error(str(exc))
+                return
+        self._load_source_for_side(side, source)
+
+    def _load_source_for_side(self, side: str, source: Source):
         self._clear_draft()
         self.load_generation[side] += 1
         token = self.load_generation[side]
@@ -600,7 +703,7 @@ class MainWindow(QMainWindow):
         if source.page is None:
 
             def work():
-                original = load_source(source)
+                original = load_source(source, original_guard=self.original_guard)
                 found = detect_quad(original)
                 h, w = original.shape[:2]
                 return (
@@ -1132,6 +1235,18 @@ class MainWindow(QMainWindow):
         if self.sheet is None:
             self.show_error("Дождитесь обработки и исправьте выделение или компоновку.")
             return
+        revisions = tuple(sorted((side, card.revision) for side, card in self.cards.items()))
+        source_fps = tuple(
+            card.source.fingerprint
+            for card in self.cards.values()
+            if card.source.fingerprint is not None
+        )
+        for fp in source_fps:
+            try:
+                self.original_guard.validate_source(fp.path, expected=fp)
+            except SourceChangedError as exc:
+                self.show_error(str(exc))
+                return
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить лист A4",
@@ -1144,14 +1259,12 @@ class MainWindow(QMainWindow):
         target = Path(path)
         if target.suffix.lower() != f".{kind}":
             target = target.with_suffix(f".{kind}")
-        originals = set(self.original_paths)
-        originals.update(card.source.path for card in self.cards.values())
-        if any(
-            target.resolve() == original.resolve()
-            or (target.exists() and original.exists() and target.samefile(original))
-            for original in originals
-        ):
-            self.show_error("Нельзя перезаписать загруженный оригинал. Выберите другое имя файла.")
+        self.original_guard.register_many(self.original_paths)
+        self.original_guard.register_many(card.source.path for card in self.cards.values())
+        try:
+            self.original_guard.assert_not_protected(target)
+        except OriginalOverwriteError as exc:
+            self.show_error(str(exc))
             return
         overwrite = target.exists()
         if overwrite:
@@ -1164,11 +1277,13 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        sheet = self.sheet
+        snap = snapshot_sheet(self.sheet, revisions=revisions, source_fingerprints=source_fps)
+        frozen_sheet = Sheet(dict(snap.images), list(snap.placements))
 
         def done(_):
             if self._closing or self._closed:
                 return
+            self.last_exported_revisions[kind] = snap.revisions
             self.export_path = target
             self.open_button.show()
             self.export_message.setText(f"Сохранено: {target.name}\n\n{PRINT_HINT}")
@@ -1176,7 +1291,13 @@ class MainWindow(QMainWindow):
 
         self.submit(
             lambda: export_sheet(
-                sheet, target, kind, overwrite=overwrite, pdf_worker=self.pdf_worker
+                frozen_sheet,
+                target,
+                kind,
+                overwrite=overwrite,
+                pdf_worker=self.pdf_worker,
+                original_guard=self.original_guard,
+                source_fingerprints=snap.source_fingerprints,
             ),
             done,
         )

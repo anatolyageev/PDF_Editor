@@ -602,3 +602,104 @@ def test_window_close_cancels_queued_pdf_work_and_shuts_down_worker(qtbot, tmp_p
     qtbot.waitUntil(lambda: window._closed, timeout=15000)
     assert not window.tasks
     assert not window.pdf_worker.is_alive
+
+
+def test_gui_blocks_export_and_assign_when_source_changed_until_reload(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    path = tmp_path / "front.png"
+    synthetic_card.save(path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    errors = []
+    dialogs_opened = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: dialogs_opened.append(True) or ("", ""),
+    )
+    window.show()
+    window.import_paths([path])
+    qtbot.waitUntil(lambda: window.sources.count() == 1 and not window.tasks, timeout=20000)
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    wait_ready(qtbot, window)
+
+    # Mutate source on disk after assignment.
+    updated = Image.new("RGB", (400, 260), (20, 130, 60))
+    updated.save(path)
+
+    # Export is blocked before opening save dialog and records no exported revision.
+    window.save("pdf")
+    assert errors and "изменился" in errors[-1]
+    assert not dialogs_opened
+    assert "pdf" not in window.last_exported_revisions
+
+    # Re-assigning using the stale thumbnail is also blocked, preserving current Card.
+    prev_card = window.cards["front"]
+    window.assign_selected("front")
+    assert "изменился" in errors[-1]
+    assert window.cards["front"] is prev_card
+
+    # Explicit reload updates source, reloads assigned side, and unblocks export.
+    window.reload_selected_source()
+    wait_ready(qtbot, window)
+    assert window.cards["front"].original.shape[:2] == (260, 400)
+
+    out_pdf = tmp_path / "exported.pdf"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, p=out_pdf, **kw: (str(p), ""))
+    window.save("pdf")
+    qtbot.waitUntil(lambda: out_pdf.exists() and not window.tasks, timeout=20000)
+    assert window.last_exported_revisions["pdf"] == (("front", window.cards["front"].revision),)
+    window.close()
+    qtbot.waitUntil(lambda: window._closed, timeout=10000)
+
+
+def test_gui_protects_symlink_and_hardlink_to_original_without_overwrite_prompt(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    orig = tmp_path / "orig.png"
+    synthetic_card.save(orig)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    errors = []
+    prompts = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args: prompts.append(args) or QMessageBox.StandardButton.Yes,
+    )
+    window.show()
+    window.import_paths([orig])
+    qtbot.waitUntil(lambda: window.sources.count() == 1 and not window.tasks, timeout=20000)
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    wait_ready(qtbot, window)
+
+    aliases = []
+    symlink = tmp_path / "alias_sym.png"
+    try:
+        symlink.symlink_to(orig)
+        aliases.append(symlink)
+    except OSError:
+        pass
+    hardlink = tmp_path / "alias_hard.png"
+    try:
+        hardlink.hardlink_to(orig)
+        aliases.append(hardlink)
+    except OSError:
+        pass
+    if not aliases:
+        pytest.skip("Neither symlinks nor hard links are supported on this filesystem.")
+
+    for alias in aliases:
+        monkeypatch.setattr(
+            QFileDialog, "getSaveFileName", lambda *args, p=alias, **kw: (str(p), "")
+        )
+        window.save("png")
+        assert errors and "оригинал" in errors[-1]
+        assert not prompts
+    window.close()
+    qtbot.waitUntil(lambda: window._closed, timeout=10000)

@@ -6,6 +6,7 @@ import pymupdf
 import pytest
 from PIL import Image
 
+from cardprint.export import OriginalGuard, SourceChangedError
 from cardprint.imaging import (
     detect_quad,
     discover,
@@ -117,3 +118,22 @@ def test_pdf_pages_and_clear_import_errors(tmp_path):
     bad_pdf.write_bytes(b"broken pdf")
     with pytest.raises(ValueError, match="повреждён"):
         discover(bad_pdf)
+
+
+def test_load_source_blocks_changed_source_until_explicit_reload(tmp_path, synthetic_card):
+    card_path = tmp_path / "source.png"
+    synthetic_card.save(card_path)
+    guard = OriginalGuard()
+    src = discover(card_path, original_guard=guard)[0]
+    assert src.fingerprint is not None
+
+    # Mutate file on disk -> loading stale Source must fail until explicitly reloaded.
+    updated = Image.new("RGB", (200, 120), (10, 120, 40))
+    updated.save(card_path)
+    with pytest.raises(SourceChangedError, match="изменился"):
+        load_source(src, original_guard=guard)
+
+    reloaded = discover(card_path, original_guard=guard)[0]
+    arr = load_source(reloaded, original_guard=guard)
+    assert arr.shape[:2] == (120, 200)
+    assert guard.is_protected(card_path)

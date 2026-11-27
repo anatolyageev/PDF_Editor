@@ -22,7 +22,7 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [pdf_worker.py](../src/cardprint/pdf_worker.py) | Single spawned PyMuPDF child process, serializable IPC requests/results, request coalescing, crash recovery, and byte-bounded `ByteLRUCache` (32 MiB thumbnails / 128 MiB display pages). No Qt dependency. |
 | [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, batched PDF discovery via `pdf_worker`, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt or top-level PyMuPDF dependency. |
 | [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, and arrange. Independent of the UI. |
-| [export.py](../src/cardprint/export.py) | Sheet, render_sheet, PDF/PNG output, staged PDF validation via `pdf_worker`, and safe file writing. No Qt dependency. |
+| [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output, and staged PDF/PNG validation. No Qt dependency. |
 | [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, zoom, and pan. |
 | [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, Card state, side assignments, settings, task coordination, and export actions. |
 | [ui/tasks.py](../src/cardprint/ui/tasks.py) | `QRunnable` `Task` for pure image work and `PdfTaskBridge` for delivering `PdfWorkerClient` results onto the GUI thread. |
@@ -137,19 +137,30 @@ Already-running work is not forcibly interrupted; obsolete results are ignored.
 
 ## Save responsibilities
 
-`MainWindow.save` checks the destination against `original_paths` and assigned
-sources, including `samefile` identity checks, and asks before replacing an existing
-file. Removing a thumbnail does not clear the imported-path history.
+`OriginalGuard` maintains an append-only registry of imported, assigned, and opened
+sources (resolved paths, raw paths, case-normalized paths, and `(st_dev, st_ino)` file
+identities where available) plus `SourceFingerprint` metadata (size and SHA-256).
+`MainWindow` uses its instance `original_guard` while headless callers (`discover`,
+`load_source`, `export_sheet`) share `get_default_original_guard()` unless an explicit
+guard is supplied. Removing a thumbnail or clearing a side never removes protection.
 
-`export_sheet` prevents unintended replacement at the filesystem operation level,
-but **does not know the original-file list**. A new CLI or other interface must
-preserve that protection separately; calling `export_sheet` alone is insufficient.
+`atomic_write_file(target, writer_fn, *, overwrite=False, validator_fn=None, original_guard=None)`
+serializes writes per destination, checks `original_guard` both before staging and
+immediately before publication, stages a temporary file beside `target`, runs
+`validator_fn` (for A4 PDFs via `pdf_worker` and 300 DPI PNGs via Pillow) before
+commit, and removes the staging file in a `finally` block. Confirmed replacement of a
+non-original target uses `os.replace`; publishing a new file uses atomic `os.link`.
+Filesystems without hard links fall back to exclusive `xb` creation and copying,
+which prevents overwriting existing files but does not make the complete file appear
+atomically during copying. An unexpected OS process crash can still leave a
+`.cardprint-*.tmp` staging file behind.
 
-Export stages a temporary file in the destination directory. Confirmed replacement
-uses `os.replace`; publishing a new file uses `os.link`. Filesystems without hard
-links fall back to exclusive `xb` creation and copying. This fallback prevents
-overwriting existing files but does not make the complete file appear atomically
-during copying. A `finally` block removes the staging file.
+`Source` carries a `SourceFingerprint` recorded at discovery. Reopening a source in
+`load_source`, `assign_selected`, or `export_sheet` revalidates the file on disk and
+blocks processing/export with `SourceChangedError` if it changed or moved until the
+user reloads it explicitly («Перезагрузить выбранный файл»). `MainWindow.save`
+captures an immutable `ExportSnapshot` (`snapshot_sheet`) and records
+`last_exported_revisions` only upon successful completion.
 
 ## Extension points
 

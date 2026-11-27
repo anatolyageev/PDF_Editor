@@ -84,20 +84,42 @@ and added export support for filesystems without hard links.
 - Next ready tasks in [TASKS.md](TASKS.md): `T-21` (depends on `T-19`) and
   `T-01` (no dependencies).
 
+### `T-21` (2026-11-27) — Shared safe-save & original/source identity guards
+
+- Added `OriginalGuard`, `SourceFingerprint`, `fingerprint_file`, `ExportSnapshot`,
+  `snapshot_sheet`, and `atomic_write_file` in `src/cardprint/export.py` with
+  per-destination write serialization, pre-staging and pre-publish original checks
+  (including symlink, hardlink/inode, case-normalized, and removed-path protection),
+  and staged output validation for both A4 PDF and 300 DPI PNG exports.
+- Refactored `export_sheet` to delegate to `atomic_write_file` and added source
+  fingerprinting + change detection (`SourceChangedError`) in `src/cardprint/imaging.py`
+  (`discover`, `discover_pdf_batches`, `load_source`) and `src/cardprint/ui/window.py`
+  (including «Перезагрузить выбранный файл» and `last_exported_revisions`).
+- Kept honest documentation of fallback/crash limits: exclusive `xb` copy on
+  filesystems without hard links prevents overwriting existing files but is not
+  atomic while copying, and an unexpected process crash can leave `.cardprint-*.tmp`.
+- Added unit and GUI tests in `tests/test_export.py`, `tests/test_imaging.py`, and
+  `tests/test_ui.py`, plus `isolate_default_original_guard` in `tests/conftest.py`.
+- Milestone 0 (Reliability: `T-18`, `T-19`, `T-21`) is now complete. Next ready
+  task in [TASKS.md](TASKS.md): `T-01` (extract domain models into
+  `src/cardprint/model.py`).
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-19` on 2026-11-27**
+The following results were obtained **after completing `T-21` on 2026-11-27**
 (Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows
 and macOS remain unverified):
 
 | Check | Result and scope |
 | --- | --- |
-| `uv run pytest -q` | **45 passed** (`13.29s`), including `tests/test_pdf_worker.py` and 10 Qt `offscreen` UI tests. |
+| `uv run pytest -q tests/test_export.py tests/test_imaging.py tests/test_ui.py` | **30 passed** (`9.54s`), Qt `offscreen`. |
+| `uv run pytest -q` | **53 passed** (`13.83s`), including 12 Qt `offscreen` UI tests and safe-save/alias/source-change tests. |
 | `uv run ruff check src tests scripts` | All checks passed. |
 | `uv run ruff format --check src tests scripts` | 18 files already formatted. |
-| `QT_QPA_PLATFORM=offscreen uv run python scripts/gui_smoke.py` | Passed: exported `sheet.pdf` and `sheet.png` via spawned PDF worker. |
 
-Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-19`):
+`gui_smoke.py` was not rerun for `T-21`; its latest recorded run remains from `T-19` on 2026-11-27.
+
+Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-21`):
 
 | Check | Result and scope |
 | --- | --- |

@@ -43,7 +43,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 | --- | --- | --- | --- | --- |
 | `T-18` | M0 · Reliability | Block export during draft selection and reject stale inspector results | `DONE` | — |
 | `T-19` | M0 · Reliability | Isolate PyMuPDF in a process and bound PDF scheduling/caches | `DONE` | `T-18` |
-| `T-21` | M0 · Reliability | Extract shared safe-save and original/source identity guards | `TODO` | `T-19` |
+| `T-21` | M0 · Reliability | Extract shared safe-save and original/source identity guards | `DONE` | `T-19` |
 | `T-01` | M1 · Foundation & UX | Extract domain models from `ui/window.py` into `src/cardprint/model.py` | `TODO` | — |
 | `T-05` | M1 · Foundation & UX | Add parametric Undo/Redo for card, assignment and layout edits | `TODO` | `T-01`, `T-18` |
 | `T-20` | M1 · Foundation & UX | Track dirty workspaces and guard close/replacement against lost edits | `TODO` | `T-05` |
@@ -97,9 +97,9 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-21`: Extract shared safe-save and original/source identity guards
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-19`
-- **Target files:** `src/cardprint/export.py`, `src/cardprint/ui/window.py`, `src/cardprint/imaging.py`, `tests/test_export.py`, `tests/test_ui.py`
+- **Target files:** `src/cardprint/export.py`, `src/cardprint/ui/window.py`, `src/cardprint/imaging.py`, `tests/conftest.py`, `tests/test_export.py`, `tests/test_imaging.py`, `tests/test_ui.py`
 - **Goal:** Reuse safe output publication and original protection before adding another exporter or project saves.
 - **Acceptance criteria:**
   - Expose `atomic_write_file(target, writer_fn, *, overwrite=False)` with staging cleanup, atomic replace/link paths and the explicitly non-atomic exclusive-copy fallback. `export_sheet` delegates without losing existing behavior.
@@ -107,7 +107,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - Track/revalidate source identities/fingerprints when reopening source content. Changed sources block processing/export until explicit reload/relink; capture an immutable export revision and serialize writes per destination.
   - Validate staged outputs before publication. Failure/cancel does not clear dirty state, change an existing target, or leave ordinary-error staging/partial output. Document the exclusive-copy and process-crash limitations honestly.
   - Cover imported-path aliases/samefile where supported, removed originals, late target collisions, replacement refusal, writer/validation failure, fallback-copy failure and successful PDF/PNG output. Filesystem alias tests may be platform-specific with explicit skips.
-- **Verification:** Target export/imaging/UI tests, then the full quality gate.
+- **Verification:** `uv run pytest -q tests/test_export.py tests/test_imaging.py tests/test_ui.py` (30 passed, `offscreen`), `uv run pytest -q` (53 passed, `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (18 files formatted).
 
 ---
 

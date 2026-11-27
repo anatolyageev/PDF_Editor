@@ -8,6 +8,12 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
+from .export import (
+    OriginalGuard,
+    SourceFingerprint,
+    fingerprint_file,
+    get_default_original_guard,
+)
 from .geometry import Quad, quad_size, validate_quad
 from .pdf_worker import (
     DEFAULT_THUMBNAIL_BATCH_SIZE,
@@ -23,6 +29,7 @@ class Source:
     path: Path
     page: int | None
     thumbnail: Image.Image
+    fingerprint: SourceFingerprint | None = None
 
     @property
     def label(self):
@@ -56,34 +63,63 @@ def discover_pdf_batches(
     *,
     batch_size: int = DEFAULT_THUMBNAIL_BATCH_SIZE,
     worker: PdfWorkerClient | None = None,
+    original_guard: OriginalGuard | None = None,
 ):
     """Yield ``(batch_sources, total_pages)`` tuples via the isolated PDF worker."""
     resolved = Path(path).resolve()
     if resolved.suffix.lower() != ".pdf":
         raise ValueError("Ожидался PDF-файл.")
+    guard = original_guard if original_guard is not None else get_default_original_guard()
+    guard.register(path)
+    fp = fingerprint_file(resolved)
+    guard.record_fingerprint(fp)
     client = worker or get_default_pdf_worker()
     info = client.inspect_pdf(resolved)
     for start in range(0, info.page_count, batch_size):
         batch = client.render_thumbnail_batch(resolved, start, count=batch_size)
-        sources = [Source(resolved, page_idx, img.to_pil()) for page_idx, img in batch.items]
+        sources = [
+            Source(resolved, page_idx, img.to_pil(), fingerprint=fp)
+            for page_idx, img in batch.items
+        ]
         yield sources, info.page_count
 
 
-def discover(path: str | Path, *, worker: PdfWorkerClient | None = None) -> list[Source]:
-    path = Path(path).resolve()
-    if path.suffix.lower() == ".pdf":
+def discover(
+    path: str | Path,
+    *,
+    worker: PdfWorkerClient | None = None,
+    original_guard: OriginalGuard | None = None,
+) -> list[Source]:
+    resolved = Path(path).resolve()
+    guard = original_guard if original_guard is not None else get_default_original_guard()
+    if resolved.suffix.lower() == ".pdf":
         sources: list[Source] = []
-        for batch_sources, _total in discover_pdf_batches(path, worker=worker):
+        for batch_sources, _total in discover_pdf_batches(
+            resolved, worker=worker, original_guard=guard
+        ):
             sources.extend(batch_sources)
         return sources
-    if path.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+    if resolved.suffix.lower() not in (".png", ".jpg", ".jpeg"):
         raise ValueError("Поддерживаются только PDF, JPG, JPEG и PNG.")
-    thumb = _photo(path)
+    guard.register(path)
+    fp = fingerprint_file(resolved)
+    guard.record_fingerprint(fp)
+    thumb = _photo(resolved)
     thumb.thumbnail((180, 140))
-    return [Source(path, None, thumb)]
+    return [Source(resolved, None, thumb, fingerprint=fp)]
 
 
-def load_source(source: Source, *, worker: PdfWorkerClient | None = None) -> np.ndarray:
+def load_source(
+    source: Source,
+    *,
+    worker: PdfWorkerClient | None = None,
+    original_guard: OriginalGuard | None = None,
+    allow_changed: bool = False,
+) -> np.ndarray:
+    guard = original_guard if original_guard is not None else get_default_original_guard()
+    guard.register(source.path, fingerprint=source.fingerprint)
+    if not allow_changed and source.fingerprint is not None:
+        guard.validate_source(source.path, expected=source.fingerprint)
     if source.page is None:
         image = _photo(source.path)
         if min(image.size) < 4:
