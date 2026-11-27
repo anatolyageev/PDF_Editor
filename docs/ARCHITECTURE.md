@@ -22,16 +22,16 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [pdf_worker.py](../src/cardprint/pdf_worker.py) | Single spawned PyMuPDF child process, serializable IPC requests/results, request coalescing, crash recovery, and byte-bounded `ByteLRUCache` (32 MiB thumbnails / 128 MiB display pages). No Qt dependency. |
 | [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, batched PDF discovery via `pdf_worker`, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt or top-level PyMuPDF dependency. |
 | [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, and arrange. Independent of the UI. |
+| [model.py](../src/cardprint/model.py) | Pure-Python domain models (`Card`, `SIDE_NAMES`). No Qt dependency. |
 | [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output, and staged PDF/PNG validation. No Qt dependency. |
 | [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, zoom, and pan. |
-| [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, Card state, side assignments, settings, task coordination, and export actions. |
+| [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, side assignments, settings, task coordination, and export actions. |
 | [ui/tasks.py](../src/cardprint/ui/tasks.py) | `QRunnable` `Task` for pure image work and `PdfTaskBridge` for delivering `PdfWorkerClient` results onto the GUI thread. |
-| [tests/](../tests/) | Geometry, processing, export, and Qt integration tests using artificial data. |
+| [tests/](../tests/) | Geometry, model, worker, processing, export, and Qt integration tests using artificial data. |
 | [scripts/](../scripts/) | Example generation and a GUI smoke test that saves screenshots and exports. |
 
-`Card` currently lives in `ui/window.py`, rather than a separate domain module.
-The geometry/layout model is separated from the UI. Do not assume an additional
-persistence layer or a general-purpose PDF editing engine exists.
+`Card` and the geometry/layout models are separated from the UI. Do not assume an
+additional persistence layer or a general-purpose PDF editing engine exists.
 
 ## Data flow
 
@@ -173,8 +173,9 @@ captures an immutable `ExportSnapshot` (`snapshot_sheet`) and records
 | New export format | export.py → physical dimensions, resolution, white background, existing-file preservation; protect originals in the calling interface. |
 | Session persistence or Undo/Redo | Not implemented. Requires explicit state modeling; store operation parameters rather than a chain of repeatedly recompressed images. |
 
-Tests by area: `tests/test_geometry.py`, `tests/test_imaging.py`,
-`tests/test_export.py`, `tests/test_ui.py`. Fixtures in `tests/conftest.py` are artificial.
+Tests by area: `tests/test_geometry.py`, `tests/test_model.py`, `tests/test_pdf_worker.py`,
+`tests/test_imaging.py`, `tests/test_export.py`, `tests/test_ui.py`. Fixtures in
+`tests/conftest.py` are artificial.
 
 ## Environment details
 

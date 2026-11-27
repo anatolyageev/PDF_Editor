@@ -104,22 +104,34 @@ and added export support for filesystems without hard links.
   task in [TASKS.md](TASKS.md): `T-01` (extract domain models into
   `src/cardprint/model.py`).
 
+### `T-01` (2026-11-27) — Extract domain models into `src/cardprint/model.py`
+
+- Extracted `Card` (preserving all revision, error, display-turn, and
+  `Source.fingerprint` fields) and `SIDE_NAMES` from `src/cardprint/ui/window.py`
+  into `src/cardprint/model.py` with zero `PySide6` or `pymupdf` imports.
+- Updated `src/cardprint/ui/window.py` to import `Card` and `SIDE_NAMES` from
+  `..model`.
+- Added `tests/test_model.py` covering `Card.source_size` across turns, defaults,
+  zero-Qt subprocess import verification, and `window.Card` identity.
+- Next ready task in [TASKS.md](TASKS.md): `T-05` (parametric Undo/Redo for
+  card, assignment, and layout edits).
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-21` on 2026-11-27**
+The following results were obtained **after completing `T-01` on 2026-11-27**
 (Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows
 and macOS remain unverified):
 
 | Check | Result and scope |
 | --- | --- |
-| `uv run pytest -q tests/test_export.py tests/test_imaging.py tests/test_ui.py` | **30 passed** (`9.54s`), Qt `offscreen`. |
-| `uv run pytest -q` | **53 passed** (`13.83s`), including 12 Qt `offscreen` UI tests and safe-save/alias/source-change tests. |
+| `uv run pytest -q tests/test_model.py tests/test_ui.py` | **16 passed** (`10.35s`), Qt `offscreen`. |
+| `uv run pytest -q` | **57 passed** (`14.45s`), including `tests/test_model.py` and 12 Qt `offscreen` UI tests. |
 | `uv run ruff check src tests scripts` | All checks passed. |
-| `uv run ruff format --check src tests scripts` | 18 files already formatted. |
+| `uv run ruff format --check src tests scripts` | 20 files already formatted. |
 
-`gui_smoke.py` was not rerun for `T-21`; its latest recorded run remains from `T-19` on 2026-11-27.
+`gui_smoke.py` was not rerun for `T-01`; its latest recorded run remains from `T-19` on 2026-11-27.
 
-Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-21`):
+Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-01`):
 
 | Check | Result and scope |
 | --- | --- |

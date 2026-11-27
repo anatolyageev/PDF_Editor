@@ -44,7 +44,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 | `T-18` | M0 · Reliability | Block export during draft selection and reject stale inspector results | `DONE` | — |
 | `T-19` | M0 · Reliability | Isolate PyMuPDF in a process and bound PDF scheduling/caches | `DONE` | `T-18` |
 | `T-21` | M0 · Reliability | Extract shared safe-save and original/source identity guards | `DONE` | `T-19` |
-| `T-01` | M1 · Foundation & UX | Extract domain models from `ui/window.py` into `src/cardprint/model.py` | `TODO` | — |
+| `T-01` | M1 · Foundation & UX | Extract domain models from `ui/window.py` into `src/cardprint/model.py` | `DONE` | — |
 | `T-05` | M1 · Foundation & UX | Add parametric Undo/Redo for card, assignment and layout edits | `TODO` | `T-01`, `T-18` |
 | `T-20` | M1 · Foundation & UX | Track dirty workspaces and guard close/replacement against lost edits | `TODO` | `T-05` |
 | `T-02` | M1 · Foundation & UX | Add Light/Dark QSS theme system (`ui/theme.py`) and SVG icon helper (`ui/icons.py`) | `TODO` | `T-01`, `T-20` |
@@ -115,7 +115,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-01`: Extract domain models from `ui/window.py` into `src/cardprint/model.py`
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** None
 - **Goal:** Separate `Card` (and future pure-Python session/state helpers) from Qt widgets in [window.py](../src/cardprint/ui/window.py) so domain logic is testable without Qt and ready for Undo/Redo and dual-mode state.
 - **Target files:**
@@ -127,9 +127,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - `Card` preserves all current fields, revision counters and defaults, including reliability changes completed before this extraction; the refactor must not revert them to the historical `0.1.0` shape.
   - `ui/window.py` imports `Card` from `..model` and behaves identically to `0.1.0`.
   - Unit tests verify `Card.source_size` across all `turns % 4` values and ensure `model.py` imports without `PySide6`.
-- **Verification:**
-  - `uv run pytest -q tests/test_model.py tests/test_ui.py`
-  - `uv run pytest -q && uv run ruff check src tests scripts && uv run ruff format --check src tests scripts`
+- **Verification:** `uv run pytest -q tests/test_model.py tests/test_ui.py` (16 passed, `offscreen`), `uv run pytest -q` (57 passed, `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (20 files formatted).
 
 ---
 

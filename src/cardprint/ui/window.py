@@ -1,7 +1,5 @@
-from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
 from PIL import Image
 from PySide6.QtCore import QSize, Qt, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QIcon
@@ -53,6 +51,7 @@ from ..imaging import (
     rotated,
     round_corners,
 )
+from ..model import SIDE_NAMES, Card
 from ..pdf_worker import (
     DEFAULT_THUMBNAIL_BATCH_SIZE,
     PDF_DPI,
@@ -65,8 +64,6 @@ from ..pdf_worker import (
 )
 from .editor import CORNER_LABELS, ImageView, pixmap, to_qimage
 from .tasks import PdfTaskBridge, Task, dispatch_pdf_request
-
-SIDE_NAMES = {"front": "Лицевая сторона", "back": "Обратная сторона"}
 
 
 class InspectorDialog(QDialog):
@@ -140,28 +137,6 @@ def thumbnail(image, limit=2000):
     result = image.copy()
     result.thumbnail((limit, limit))
     return result
-
-
-@dataclass
-class Card:
-    source: Source
-    original: np.ndarray
-    points: tuple
-    turns: int = 0
-    radius: float = 0
-    size: CardSize = field(default_factory=CardSize)
-    revision: int = 0
-    ready_revision: int = -1
-    cropped: Image.Image | None = None
-    rendered: Image.Image | None = None
-    display: Image.Image | None = None
-    display_turns: int = 0
-    error: str | None = None
-
-    @property
-    def source_size(self):
-        h, w = self.original.shape[:2]
-        return (h, w) if self.turns % 2 else (w, h)
 
 
 class MainWindow(QMainWindow):
