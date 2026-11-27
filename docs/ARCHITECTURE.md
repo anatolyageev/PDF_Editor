@@ -22,7 +22,7 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [pdf_worker.py](../src/cardprint/pdf_worker.py) | Single spawned PyMuPDF child process, serializable IPC requests/results, request coalescing, crash recovery, and byte-bounded `ByteLRUCache` (32 MiB thumbnails / 128 MiB display pages). No Qt dependency. |
 | [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, batched PDF discovery via `pdf_worker`, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt or top-level PyMuPDF dependency. |
 | [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, and arrange. Independent of the UI. |
-| [model.py](../src/cardprint/model.py) | Pure-Python domain models (`Card`, `SIDE_NAMES`). No Qt dependency. |
+| [model.py](../src/cardprint/model.py) | Pure-Python domain models (`Card`, `SIDE_NAMES`) and memory-bounded parametric `UndoStack` (`CardSnapshot`, `WorkspaceSnapshot`). No Qt dependency. |
 | [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output, and staged PDF/PNG validation. No Qt dependency. |
 | [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, zoom, and pan. |
 | [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, side assignments, settings, task coordination, and export actions. |
@@ -129,6 +129,11 @@ Several independent counters, caches, and state fields protect result freshness 
   reject stale inspector successes and errors across card edits, side replacement or
   removal, and window closing (`_closing` / `_closed`); open inspector dialogs
   immediately mark themselves stale when their card revision or assignment changes.
+- `UndoStack` / `_restore_snapshot`: retains up to 50 `WorkspaceSnapshot` entries and
+  at most `256 MiB` of history-only `original` pixel buffers (counted once per shared
+  array, excluding derived `cropped`/`rendered`/`display` images). Restoring a state
+  allocates fresh monotonic `_card_revision_seq`, `load_generation`, and
+  `inspector_request_id` tokens and preserves `original_guard` entries.
 
 `invalidate_sheet` clears the ready `Sheet` and disables export. Export becomes
 available only after current processing and successful `arrange` validation.

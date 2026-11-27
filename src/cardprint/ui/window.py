@@ -2,7 +2,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QSize, Qt, QThreadPool, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QIcon
+from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -51,7 +51,7 @@ from ..imaging import (
     rotated,
     round_corners,
 )
-from ..model import SIDE_NAMES, Card
+from ..model import SIDE_NAMES, Card, UndoStack, WorkspaceSnapshot
 from ..pdf_worker import (
     DEFAULT_THUMBNAIL_BATCH_SIZE,
     PDF_DPI,
@@ -150,6 +150,8 @@ class MainWindow(QMainWindow):
         self.layout_generation = 0
         self.import_generation = 0
         self.session_id = 1
+        self._card_revision_seq = 0
+        self.history = UndoStack(WorkspaceSnapshot((), Layout()))
         self.load_generation = {"front": 0, "back": 0}
         self.inspector_request_id = {"front": 0, "back": 0}
         self.inspectors: list[InspectorDialog] = []
@@ -176,6 +178,7 @@ class MainWindow(QMainWindow):
             "Добавьте изображения или PDF. Все документы обрабатываются на этом компьютере."
         )
         self._sync_controls()
+        self._sync_history_controls()
         self.invalidate_sheet("Назначьте стороны документа.")
         self.preview.set_image(Image.new("RGB", (420, 594), "white"))
 
@@ -186,6 +189,10 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.add_button = self.button("Добавить файлы", self.add_files)
         toolbar.addWidget(self.add_button)
+        self.undo_button = self.button("Отменить", self.undo)
+        self.redo_button = self.button("Повторить", self.redo)
+        toolbar.addWidget(self.undo_button)
+        toolbar.addWidget(self.redo_button)
         toolbar.addStretch()
         toolbar.addWidget(self.button("Предпросмотр", lambda: self.tabs.setCurrentIndex(1)))
         self.pdf_button = self.button("Сохранить PDF", lambda: self.save("pdf"))
@@ -193,6 +200,11 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.pdf_button)
         toolbar.addWidget(self.png_button)
         outer.addLayout(toolbar)
+        self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
+        self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
+        self._redo_shift_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+Z"), self, activated=self.redo
+        )
         splitter = QSplitter()
         outer.addWidget(splitter, 1)
 
@@ -342,9 +354,9 @@ class MainWindow(QMainWindow):
         self.size_mode.currentIndexChanged.connect(self.card_options_changed)
         for spin in (self.width, self.height, self.radius):
             spin.valueChanged.connect(self.card_options_changed)
-        self.template.currentIndexChanged.connect(self.layout_changed)
+        self.template.currentIndexChanged.connect(self.layout_options_changed)
         for spin in (self.gap, self.margin, self.offset_x, self.offset_y):
-            spin.valueChanged.connect(self.layout_changed)
+            spin.valueChanged.connect(self.layout_options_changed)
 
     @staticmethod
     def button(title, callback):
@@ -661,13 +673,14 @@ class MainWindow(QMainWindow):
             self.refresh_inspectors()
             self.side_combo.setCurrentIndex(0 if side == "front" else 1)
             self.active_side = side
-            self.show_card()
-            self.render_card(side)
             self.statusBar().showMessage(
                 "Проверьте автоматически найденные углы."
                 if found
                 else "Контур не найден. Укажите четыре угла вручную или перетащите точки."
             )
+            self._record_history(f"Назначение: {SIDE_NAMES[side]}")
+            self.show_card()
+            self.render_card(side)
 
         def fail_load(message):
             if not (self._closing or self._closed) and token == self.load_generation[side]:
@@ -735,7 +748,9 @@ class MainWindow(QMainWindow):
         self.load_generation[self.active_side] += 1
         self.pending_loads.discard(self.active_side)
         self.pdf_worker.cancel_key(("load_side", self.active_side))
-        self.cards.pop(self.active_side, None)
+        removed = self.cards.pop(self.active_side, None)
+        if removed is not None:
+            self._record_history(f"Удаление: {SIDE_NAMES[self.active_side]}")
         self.refresh_inspectors()
         self.show_card()
         self.layout_changed()
@@ -871,6 +886,7 @@ class MainWindow(QMainWindow):
             return
         card.points = points
         card.cropped = None
+        self._record_history("Изменение выделения")
         self.render_card(self.active_side)
 
     def pick_points(self):
@@ -885,6 +901,7 @@ class MainWindow(QMainWindow):
             card.points = full_quad(*card.source_size)
             self.editor.set_points(card.points)
             card.cropped = None
+            self._record_history("Сброс выделения")
             self.render_card(self.active_side)
 
     def autodetect(self):
@@ -918,6 +935,7 @@ class MainWindow(QMainWindow):
             card.cropped = None
             if self.active_side == side:
                 self.editor.set_points(points)
+            self._record_history("Определение границ")
             self.render_card(side)
             self.statusBar().showMessage("Контур найден. Проверьте углы и края результата.")
 
@@ -942,6 +960,7 @@ class MainWindow(QMainWindow):
         card.points = rotate_quad(card.points, card.source_size[1])
         card.turns = (card.turns + 1) % 4
         card.cropped = None
+        self._record_history("Поворот на 90°")
         self.render_card(side, update_display=True)
 
     def reset_card(self):
@@ -953,6 +972,7 @@ class MainWindow(QMainWindow):
             card.radius = 0
             card.size = CardSize()
             card.cropped = None
+            self._record_history("Сброс правок стороны")
             self.render_card(self.active_side, update_display=True)
 
     def card_options_changed(self):
@@ -964,6 +984,7 @@ class MainWindow(QMainWindow):
                 self.size_mode.currentData(), self.width.value(), self.height.value()
             )
             card.radius = self.radius.value()
+            self._record_history("Параметры стороны")
             self.render_card(self.active_side)
             self._sync_controls()
 
@@ -971,11 +992,12 @@ class MainWindow(QMainWindow):
         if self._closing or self._closed:
             return
         card = self.cards[side]
-        card.revision += 1
+        self._card_revision_seq = max(self._card_revision_seq, card.revision) + 1
+        card.revision = self._card_revision_seq
         revision = card.revision
         card.error = None
         source_size = card.source_size
-        update_display = update_display or card.display_turns != card.turns
+        update_display = update_display or card.display is None or card.display_turns != card.turns
         turns, points, radius, size, cached = (
             card.turns,
             card.points,
@@ -1050,6 +1072,117 @@ class MainWindow(QMainWindow):
             self.offset_x.value(),
             self.offset_y.value(),
         )
+
+    def layout_options_changed(self):
+        if self.syncing or self._closing or self._closed:
+            return
+        self._record_history("Компоновка A4")
+        self.layout_changed()
+
+    def _sync_history_controls(self):
+        self.undo_button.setEnabled(self.history.can_undo)
+        self.redo_button.setEnabled(self.history.can_redo)
+        evicted_note = (
+            f" (часть старой истории очищена; доступно шагов: {self.history.undo_depth})"
+            if self.history.evicted_count > 0
+            else ""
+        )
+        if self.history.can_undo:
+            label = self.history.undo_label or "Правка"
+            self.undo_button.setToolTip(f"Отменить: {label} (Ctrl+Z){evicted_note}")
+        else:
+            self.undo_button.setToolTip(f"Нечего отменять (Ctrl+Z){evicted_note}")
+        if self.history.can_redo:
+            label = self.history.redo_label or "Правка"
+            self.redo_button.setToolTip(f"Повторить: {label} (Ctrl+Y / Ctrl+Shift+Z)")
+        else:
+            self.redo_button.setToolTip("Нечего повторять (Ctrl+Y / Ctrl+Shift+Z)")
+
+    def _record_history(self, label: str):
+        snap = WorkspaceSnapshot.from_state(self.cards, self.current_layout())
+        result = self.history.push(snap, label)
+        self._sync_history_controls()
+        if result.evicted > 0:
+            if result.evicted_for_memory > 0:
+                self.statusBar().showMessage(
+                    f"Часть старой истории отмены очищена по лимиту памяти (доступно шагов: {self.history.undo_depth})."
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"Часть старой истории отмены очищена (доступно шагов: {self.history.undo_depth})."
+                )
+
+    def undo(self):
+        if self._closing or self._closed:
+            return
+        step = self.history.undo()
+        if step is None:
+            return
+        snapshot, label = step
+        suffix = f": {label}" if label else ""
+        self._restore_snapshot(snapshot, f"Отменено{suffix}.")
+
+    def redo(self):
+        if self._closing or self._closed:
+            return
+        step = self.history.redo()
+        if step is None:
+            return
+        snapshot, label = step
+        suffix = f": {label}" if label else ""
+        self._restore_snapshot(snapshot, f"Повторено{suffix}.")
+
+    def _restore_snapshot(self, snapshot: WorkspaceSnapshot, status_message: str):
+        self._clear_draft()
+        self.layout_timer.stop()
+        for side in ("front", "back"):
+            self.load_generation[side] += 1
+            self.pending_loads.discard(side)
+            self.pdf_worker.cancel_key(("load_side", side))
+            self.inspector_request_id[side] += 1
+
+        previous_cards = self.cards
+        restored: dict[str, Card] = {}
+        for side, card_snap in snapshot.cards:
+            self._card_revision_seq += 1
+            card = Card.from_snapshot(card_snap, revision=self._card_revision_seq)
+            old_card = previous_cards.get(side)
+            if (
+                old_card is not None
+                and old_card.original is card_snap.original
+                and old_card.display is not None
+                and old_card.display_turns == card.turns
+            ):
+                card.display = old_card.display
+                card.display_turns = old_card.display_turns
+            restored[side] = card
+        self.cards = restored
+
+        self.syncing = True
+        try:
+            idx = self.template.findData(snapshot.layout.template)
+            if idx >= 0:
+                self.template.setCurrentIndex(idx)
+            self.gap.setValue(snapshot.layout.gap_mm)
+            self.margin.setValue(snapshot.layout.margin_mm)
+            self.offset_x.setValue(snapshot.layout.offset_x_mm)
+            self.offset_y.setValue(snapshot.layout.offset_y_mm)
+            if self.active_side not in self.cards and self.cards:
+                next_side = next(iter(self.cards))
+                self.active_side = next_side
+                self.side_combo.setCurrentIndex(0 if next_side == "front" else 1)
+        finally:
+            self.syncing = False
+
+        self.refresh_inspectors()
+        self.show_card()
+        self._sync_history_controls()
+        self.statusBar().showMessage(status_message)
+        if self.cards:
+            for side, card in self.cards.items():
+                self.render_card(side, update_display=(card.display is None))
+        else:
+            self.refresh_sheet()
 
     def layout_changed(self):
         if self.syncing or self._closing or self._closed:

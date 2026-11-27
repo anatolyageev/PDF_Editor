@@ -45,7 +45,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 | `T-19` | M0 · Reliability | Isolate PyMuPDF in a process and bound PDF scheduling/caches | `DONE` | `T-18` |
 | `T-21` | M0 · Reliability | Extract shared safe-save and original/source identity guards | `DONE` | `T-19` |
 | `T-01` | M1 · Foundation & UX | Extract domain models from `ui/window.py` into `src/cardprint/model.py` | `DONE` | — |
-| `T-05` | M1 · Foundation & UX | Add parametric Undo/Redo for card, assignment and layout edits | `TODO` | `T-01`, `T-18` |
+| `T-05` | M1 · Foundation & UX | Add parametric Undo/Redo for card, assignment and layout edits | `DONE` | `T-01`, `T-18` |
 | `T-20` | M1 · Foundation & UX | Track dirty workspaces and guard close/replacement against lost edits | `TODO` | `T-05` |
 | `T-02` | M1 · Foundation & UX | Add Light/Dark QSS theme system (`ui/theme.py`) and SVG icon helper (`ui/icons.py`) | `TODO` | `T-01`, `T-20` |
 | `T-03` | M1 · Foundation & UX | Add drag-and-drop import, visual Front/Back slot cards, and source badges | `TODO` | `T-02` |
@@ -203,7 +203,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-05`: Add parametric Undo/Redo for card, assignment and layout edits
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-01`, `T-18`
 - **Goal:** Provide reliable non-destructive Undo/Redo using lightweight parameter snapshots (never duplicating original pixel arrays).
 - **Target files:**
@@ -218,9 +218,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - Unit and UI tests verify multi-step undo/redo across corner edits, rotation, and layout changes.
   - Enforce both 50 entries and a 256 MiB initial budget for history-only retained originals/assets, counting shared buffers once; do not retain derived rendered buffers. Show when older history is discarded.
   - Undo/Redo issues fresh monotonic generations, never restores stale task counters, and never removes paths from original-file protection. Test side replacement/removal, history eviction, redo clearing, and delayed old task completion after Undo.
-- **Verification:**
-  - `uv run pytest -q tests/test_model.py tests/test_ui.py`
-  - `uv run pytest -q && uv run ruff check src tests scripts && uv run ruff format --check src tests scripts`
+- **Verification:** `uv run pytest -q tests/test_model.py tests/test_ui.py` (21 passed, `offscreen`), `uv run pytest -q` (62 passed, `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (20 files formatted).
 
 ---
 

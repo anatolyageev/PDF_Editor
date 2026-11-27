@@ -227,6 +227,8 @@ def _setup_front_with_controller(qtbot, tmp_path, synthetic_card):
     controller = ManualTaskController(window)
     window.show()
     qtbot.waitExposed(window)
+    window.activateWindow()
+    qtbot.waitUntil(window.isActiveWindow, timeout=2000)
     window.import_paths([path])
     controller.drain()
     window.sources.setCurrentRow(0)
@@ -703,3 +705,164 @@ def test_gui_protects_symlink_and_hardlink_to_original_without_overwrite_prompt(
         assert not prompts
     window.close()
     qtbot.waitUntil(lambda: window._closed, timeout=10000)
+
+
+def test_undo_redo_across_corners_rotation_layout_shortcuts_and_cancel_noop(
+    qtbot, tmp_path, synthetic_card
+):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    assert window.history.undo_depth == 1
+    assert window.undo_button.isEnabled()
+    assert not window.redo_button.isEnabled()
+
+    # Cancelled 4-point draft must not push a history step.
+    window.pick_points()
+    qtbot.keyClick(window.editor, Qt.Key.Key_Escape)
+    controller.drain()
+    assert window.history.undo_depth == 1
+
+    # Commit 1: 4-point selection
+    initial_points = window.cards["front"].points
+    new_points = ((25, 25), (815, 25), (815, 505), (25, 505))
+    window.pick_points()
+    for pt in new_points:
+        qtbot.mouseClick(
+            window.editor.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=window.editor.mapFromScene(QPointF(*pt)),
+        )
+    controller.drain()
+    committed_points = window.cards["front"].points
+    assert window.history.undo_depth == 2
+
+    # Commit 2: rotate 90 degrees
+    window.rotate()
+    controller.drain()
+    assert window.cards["front"].turns == 1
+    assert window.history.undo_depth == 3
+
+    # Commit 3: corner radius
+    window.radius.setValue(4)
+    controller.drain()
+    assert window.cards["front"].radius == 4
+    assert window.history.undo_depth == 4
+
+    # Commit 4: layout gap
+    window.gap.setValue(24)
+    controller.drain()
+    assert window.gap.value() == 24
+    assert window.history.undo_depth == 5
+
+    # Undo gap via Ctrl+Z shortcut (focus editor so spinbox doesn't intercept Ctrl+Z)
+    window.editor.setFocus()
+    qtbot.keyClick(window.editor, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    controller.drain()
+    assert window.gap.value() == 15
+    assert window.cards["front"].radius == 4
+    assert window.redo_button.isEnabled()
+    assert "Компоновка" in window.redo_button.toolTip()
+
+    # Undo radius, rotation, and corner selection
+    window.undo()
+    controller.drain()
+    assert window.cards["front"].radius == 0
+    assert window.cards["front"].turns == 1
+
+    window.undo()
+    controller.drain()
+    assert window.cards["front"].turns == 0
+    assert window.cards["front"].points == committed_points
+
+    window.undo()
+    controller.drain()
+    assert window.cards["front"].points == initial_points
+    assert window.history.undo_depth == 1
+
+    # Redo via Ctrl+Y and Ctrl+Shift+Z
+    window.editor.setFocus()
+    qtbot.keyClick(window.editor, Qt.Key.Key_Y, Qt.KeyboardModifier.ControlModifier)
+    controller.drain()
+    assert window.cards["front"].points == committed_points
+
+    qtbot.keyClick(
+        window.editor,
+        Qt.Key.Key_Z,
+        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+    )
+    controller.drain()
+    assert window.cards["front"].turns == 1
+    assert window.history.can_redo
+
+    # New edit clears redo stack.
+    window.radius.setValue(6)
+    controller.drain()
+    assert not window.history.can_redo
+    assert not window.redo_button.isEnabled()
+    window.close()
+
+
+def test_undo_redo_side_replacement_removal_original_guard_eviction_and_delayed_task(
+    qtbot, tmp_path, synthetic_card
+):
+    front_path = tmp_path / "front.png"
+    back_path = tmp_path / "back.png"
+    synthetic_card.save(front_path)
+    synthetic_card.transpose(Image.Transpose.FLIP_LEFT_RIGHT).save(back_path)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    controller = ManualTaskController(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window.import_paths([front_path, back_path])
+    controller.drain()
+
+    # Assign front, replace front with back, then remove front.
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    controller.drain()
+    assert window.cards["front"].source.path == front_path.resolve()
+
+    window.sources.setCurrentRow(1)
+    window.assign_selected("front")
+    controller.drain()
+    assert window.cards["front"].source.path == back_path.resolve()
+
+    window.remove_side()
+    controller.drain()
+    assert "front" not in window.cards
+
+    # Undo removal -> back.png restored; undo replacement -> front.png restored.
+    window.undo()
+    controller.drain()
+    assert window.cards["front"].source.path == back_path.resolve()
+
+    window.undo()
+    controller.drain()
+    assert window.cards["front"].source.path == front_path.resolve()
+
+    # Original protection still guards both files after undo/removal cycles.
+    assert window.original_guard.is_protected(front_path)
+    assert window.original_guard.is_protected(back_path)
+
+    # Delayed old render task completing AFTER Undo must be ignored.
+    window.radius.setValue(5)
+    assert len(controller.pending) == 1
+    window.undo()
+    assert len(controller.pending) == 2
+    # Complete the delayed OLD (radius=5) task first!
+    controller.complete_at(0)
+    assert window.cards["front"].radius == 0
+    assert window.cards["front"].ready_revision != window.cards["front"].revision
+    controller.drain()
+    assert window.cards["front"].radius == 0
+    assert window.cards["front"].ready_revision == window.cards["front"].revision
+
+    # Memory-budget eviction discloses reduced history in status bar.
+    window.history.max_bytes = 100
+    window.sources.setCurrentRow(1)
+    window.assign_selected("front")
+    controller.drain()
+    assert window.history.evicted_for_memory_count >= 1
+    assert "истории" in window.statusBar().currentMessage().lower()
+    window.close()

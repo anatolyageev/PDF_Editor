@@ -116,22 +116,42 @@ and added export support for filesystems without hard links.
 - Next ready task in [TASKS.md](TASKS.md): `T-05` (parametric Undo/Redo for
   card, assignment, and layout edits).
 
+### `T-05` (2026-11-27) — Parametric Undo/Redo (`Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z`)
+
+- Added `CardSnapshot`, `WorkspaceSnapshot`, `HistoryEntry`, `PushResult`, and
+  memory-aware `UndoStack` in `src/cardprint/model.py` (capped at 50 steps and
+  256 MiB of history-only retained original buffers, counting shared arrays once
+  and retaining no derived `cropped`/`rendered`/`display` buffers).
+- Wired «Отменить» (`Ctrl+Z`) and «Повторить» (`Ctrl+Y` / `Ctrl+Shift+Z`)
+  buttons, shortcuts, descriptive tooltips, and status-bar eviction notices
+  in `src/cardprint/ui/window.py` across corners, rotation, card options, resets,
+  side assignment/replacement/removal, and layout changes.
+- Ensured Undo/Redo issues fresh monotonic card revisions, load generations, and
+  inspector request IDs without dropping any original-file protection, and ignores
+  cancelled drafts / no-op edits.
+- Added unit and deterministic UI tests in `tests/test_model.py` and
+  `tests/test_ui.py` covering multi-step undo/redo, shortcuts, redo clearing,
+  side replacement/removal, byte-budget eviction disclosure, and delayed pre-undo
+  task rejection.
+- Next ready task in [TASKS.md](TASKS.md): `T-20` (dirty workspace tracking and
+  close/replacement loss guards).
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-01` on 2026-11-27**
+The following results were obtained **after completing `T-05` on 2026-11-27**
 (Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows
 and macOS remain unverified):
 
 | Check | Result and scope |
 | --- | --- |
-| `uv run pytest -q tests/test_model.py tests/test_ui.py` | **16 passed** (`10.35s`), Qt `offscreen`. |
-| `uv run pytest -q` | **57 passed** (`14.45s`), including `tests/test_model.py` and 12 Qt `offscreen` UI tests. |
+| `uv run pytest -q tests/test_model.py tests/test_ui.py` | **21 passed** (`8.91s`), Qt `offscreen`. |
+| `uv run pytest -q` | **62 passed** (`15.19s`), including 14 Qt `offscreen` UI tests and 7 `model.py` tests. |
 | `uv run ruff check src tests scripts` | All checks passed. |
 | `uv run ruff format --check src tests scripts` | 20 files already formatted. |
 
-`gui_smoke.py` was not rerun for `T-01`; its latest recorded run remains from `T-19` on 2026-11-27.
+`gui_smoke.py` was not rerun for `T-05`; its latest recorded run remains from `T-19` on 2026-11-27.
 
-Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-01`):
+Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-05`):
 
 | Check | Result and scope |
 | --- | --- |
@@ -181,8 +201,10 @@ These describe the first version's boundaries, **not an approved implementation 
   are limited to 80 megapixels.
 - An arbitrary quadrilateral's aspect ratio is estimated from its edge lengths;
   the true aspect ratio is not automatically recovered from a perspective photo.
-- No session save/restore, Undo/Redo, multi-document batch processing, or direct
-  printing. Reset to original and opening exported files are available.
+- Parametric Undo/Redo is implemented for CardPrint Mode (50 steps / 256 MiB
+  history-only budget); session save/restore, multi-document batch processing,
+  and direct printing remain unimplemented. Reset to original and opening
+  exported files are available.
 - No specialized ICC/CMYK color management. The working representation is RGB.
 - Geometry supports `front`/`back` on one A4 sheet. Single-side export is allowed,
   and the number of assigned sides is shown explicitly.
