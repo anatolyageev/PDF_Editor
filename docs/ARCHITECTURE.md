@@ -142,7 +142,12 @@ coordinates and width. Quantization and antialiasing can differ between renderer
 Rulers use the viewport transform and adaptive tick labels; margin/snap guides
 are painted in the foreground. Those guides never enter `Sheet` or exports, and
 toggling their visibility does not change history or dirty checkpoints. A layout
-refresh preserves manually chosen zoom/pan.
+refresh preserves manually chosen zoom/pan. `SheetView` also displays A4
+`TextAnnotation` overlays rendered via `render_text_annotation_rgba`, supports
+click-to-place insertion, drag-to-move in mm, double-click focus, `Delete`
+removal, and draws selection highlights and red dashed invalid-bounds outlines
+in the foreground. Both card and annotation validation block export whenever any
+item has unsupported glyphs or extends outside A4 bounds.
 
 A mouse press on a card starts a group-position transaction. Only pixmap positions
 and the small crop-mark set change during motion. `position_group` clamps to the
@@ -190,12 +195,15 @@ Several independent counters, caches, and state fields protect result freshness 
   reject stale inspector successes and errors across card edits, side replacement or
   removal, and window closing (`_closing` / `_closed`); open inspector dialogs
   immediately mark themselves stale when their card revision or assignment changes.
-- `UndoStack` / `_restore_snapshot`: retains up to 50 `WorkspaceSnapshot` entries and
-  at most `256 MiB` of history-only `original` pixel buffers (counted once per shared
-  array, excluding derived `cropped`/`rendered`/`display` images), enforcing the byte
-  budget on `push()`, `undo()`, and `redo()`. Restoring a state allocates fresh
-  monotonic `_card_revision_seq`, `load_generation`, and `inspector_request_id` tokens
-  and preserves `original_guard` entries.
+- `UndoStack` / `_restore_snapshot`: retains up to 50 `WorkspaceSnapshot` entries
+  (including `annotations: tuple[TextAnnotation, ...]`) and at most `256 MiB` of
+  history-only `original` pixel buffers (counted once per shared array, excluding
+  derived `cropped`/`rendered`/`display` images), enforcing the byte budget on
+  `push()`, `undo()`, and `redo()`. Restoring a state allocates fresh monotonic
+  `_card_revision_seq`, `load_generation`, and `inspector_request_id` tokens and
+  preserves `original_guard` entries. Window-level `eventFilter` preserves native
+  typing shortcuts inside `QPlainTextEdit`/`QLineEdit`/spinboxes while coalesced
+  text edits flush into history prior to export or canvas Undo/Redo.
 - `_reload_generation` and `_save_generation`: ensure superseded source reloads do
   not overwrite newer side assignments or in-flight side loads, and obsolete
   pre-dialog export validations cannot open stale save dialogs.

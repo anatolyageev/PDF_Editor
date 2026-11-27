@@ -312,11 +312,50 @@ reported against commit `051d9b5` before proceeding to `T-02`:
 - Next ready task in [TASKS.md](TASKS.md): `T-08` (interactive A4 text & watermark
   editing UI with presets and Undo/Redo).
 
+### `T-08` (2026-11-27) — Interactive A4 text & watermark editing UI with presets and Undo/Redo
+
+- Extended `WorkspaceSnapshot` in `src/cardprint/model.py` to track
+  `annotations: tuple[TextAnnotation, ...]` across Undo/Redo and clean/dirty checkpoints.
+- Added `render_text_annotation_rgba(layout, dpi=150.0)` and shared overlay rendering
+  in `src/cardprint/export.py`, plus `"text"` and `"watermark"` monochrome SVG icons
+  in `src/cardprint/ui/icons.py`.
+- Extended `SheetView` in `src/cardprint/ui/editor.py` with click-to-place mode,
+  RGBA overlay items, drag-to-reposition in millimetres, foreground selection handles,
+  invalid red dashed bounds indicators, double-click inspector focus, `Delete`, and
+  `Esc` placement/drag cancellation without resetting user zoom/pan.
+- Wired «Добавить текст», «Водяной знак» (capturing the insertion-time date via
+  `_date_provider`), and the right-panel text inspector (`text_content`, `text_font`,
+  `text_align`, `text_size`, `text_angle`, `text_opacity`, color picker, delete, and
+  inline Russian validation feedback) in `src/cardprint/ui/window.py`. Preserved native
+  editing shortcuts inside `QPlainTextEdit` / `QLineEdit` / spinboxes while keeping
+  canvas Undo/Redo (`Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y`), coalesced typing history
+  flushed prior to `save()`, and A4 bounds/glyph validation before allowing export.
+- Added model and Qt UI tests in `tests/test_model.py` and `tests/test_ui.py` covering
+  snapshot Undo/Redo for annotations, click-to-place, watermark date capture,
+  PDF/PNG Cyrillic export, dragging, double-click/Delete, bounds blocking, and native
+  text-input shortcuts.
+- Next ready task in [TASKS.md](TASKS.md): `T-09` (dual-mode workspace shell using
+  shared save guards); not started.
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-07` on 2026-11-27**
+The following results were obtained **after completing `T-08` on 2026-11-27**
 (Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows
 and macOS remain unverified):
+
+| Check | Result and scope |
+| --- | --- |
+| `uv run pytest -q tests/test_model.py tests/test_ui.py` | **52 passed** (`24.33s`), Qt `offscreen` (prior to formatting pass that reformatted 2 files). |
+| `uv run pytest -q` | **110 passed**, **1 warning** (`30.94s`), Qt `offscreen` (after the final edit and formatting). |
+| `uv run python -u -m pytest -v` | **110 passed**, **1 warning** (`30.44s`), Qt `offscreen` (after the final edit and formatting). |
+| `uv run ruff check src tests scripts` | All checks passed (after the final edit and formatting). |
+| `uv run ruff format --check src tests scripts` | 24 files already formatted (after the final edit and formatting). |
+
+The full runs showed the same pre-existing `PytestUnraisableExceptionWarning` on
+`BytesIO` finalization (`BufferError: Existing exports of data: object cannot be
+re-sized`); `gui_smoke.py` was not rerun for `T-08`.
+
+Previous `T-07` verification (2026-11-27):
 
 | Check | Result and scope |
 | --- | --- |

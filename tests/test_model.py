@@ -7,7 +7,7 @@ from PIL import Image
 import cardprint.model as model
 import cardprint.ui.window as window
 from cardprint.export import SourceFingerprint
-from cardprint.geometry import CardSize, Layout
+from cardprint.geometry import CardSize, Layout, TextAnnotation
 from cardprint.imaging import Source, full_quad
 
 
@@ -266,3 +266,34 @@ def test_workspace_checkpoints_independent_exports_project_and_undo_to_checkpoin
     assert not checkpoints.is_project_dirty(s2)
     assert not checkpoints.needs_close_confirmation(s2)
     assert not checkpoints.is_export_current("pdf", s2)
+
+
+def test_workspace_snapshot_undo_and_checkpoints_track_text_annotations(tmp_path):
+    card = _make_card(tmp_path, "front.png")
+    s1 = model.WorkspaceSnapshot.from_state({"front": card}, Layout())
+    stack = model.UndoStack(s1)
+    checkpoints = model.WorkspaceCheckpoints(s1)
+
+    ann1 = TextAnnotation(id="a1", text="Копия верна", x_mm=20.0, y_mm=30.0)
+    s2 = model.WorkspaceSnapshot.from_state({"front": card}, Layout(), (ann1,))
+    assert stack.push(s2, "Добавление текста").recorded
+    assert checkpoints.needs_close_confirmation(s2)
+
+    ann2 = TextAnnotation(
+        id="a1", text="Копия верна · испр.", x_mm=25.0, y_mm=35.0, opacity=0.4, angle_deg=-30.0
+    )
+    s3 = model.WorkspaceSnapshot.from_state({"front": card}, Layout(), (ann2,))
+    assert stack.push(s3, "Изменение текста").recorded
+
+    checkpoints.mark_exported("pdf", s3, (("front", 1),), tmp_path / "out.pdf")
+    assert not checkpoints.needs_close_confirmation(s3)
+
+    # Undoing back marks export stale and restores previous annotations cleanly.
+    undone = stack.undo()
+    assert undone is not None and undone[0].annotations == (ann1,)
+    assert checkpoints.is_last_export_stale(undone[0])
+
+    # Redoing restores s3 and clears close prompt again.
+    redone = stack.redo()
+    assert redone is not None and redone[0] == s3
+    assert not checkpoints.needs_close_confirmation(redone[0])

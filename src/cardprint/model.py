@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .geometry import CardSize, Layout
+from .geometry import CardSize, Layout, TextAnnotation
 from .imaging import Source
 
 SIDE_NAMES = {"front": "Лицевая сторона", "back": "Обратная сторона"}
@@ -49,13 +49,19 @@ class WorkspaceSnapshot:
 
     cards: tuple[tuple[str, CardSnapshot], ...] = ()
     layout: Layout = field(default_factory=Layout)
+    annotations: tuple[TextAnnotation, ...] = ()
 
     @classmethod
-    def from_state(cls, cards: dict[str, "Card"], layout: Layout) -> "WorkspaceSnapshot":
+    def from_state(
+        cls,
+        cards: dict[str, "Card"],
+        layout: Layout,
+        annotations: tuple[TextAnnotation, ...] | list[TextAnnotation] = (),
+    ) -> "WorkspaceSnapshot":
         ordered = tuple(
             (side, cards[side].snapshot()) for side in ("front", "back") if side in cards
         )
-        return cls(cards=ordered, layout=layout)
+        return cls(cards=ordered, layout=layout, annotations=tuple(annotations))
 
     def card_map(self) -> dict[str, CardSnapshot]:
         return dict(self.cards)

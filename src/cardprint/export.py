@@ -311,14 +311,15 @@ def _prepare_text_layouts(sheet: Sheet) -> tuple[TextLayout, ...]:
     return tuple(layout_text_annotation(ann, validate_bounds=True) for ann in sheet.annotations)
 
 
-def _draw_text_annotation_pil(target: Image.Image, layout: TextLayout, dpi: float) -> None:
+def _render_annotation_overlay(
+    layout: TextLayout, dpi: float
+) -> tuple[Image.Image, tuple[int, int]]:
     ann = layout.annotation
     scale = float(dpi) / 25.4
     pil_font = load_pil_font(ann.font_family, ann.font_size_pt, dpi)
     r, g, b = parse_hex_color(ann.color_hex)
 
     pad = 16
-    sheet_w, sheet_h = target.size
     ax_sheet = float(ann.x_mm) * scale
     ay_sheet = float(ann.y_mm) * scale
     lx0 = math.floor(layout.local_bounds_mm[0] * scale) - pad
@@ -352,38 +353,57 @@ def _draw_text_annotation_pil(target: Image.Image, layout: TextLayout, dpi: floa
         local.putalpha(alpha)
 
     if ann.angle_deg == 0.0:
-        dx0 = max(0, sx0)
-        dy0 = max(0, sy0)
-        dx1 = min(sheet_w, sx0 + local.width)
-        dy1 = min(sheet_h, sy0 + local.height)
-        if dx1 <= dx0 or dy1 <= dy0:
-            return
-        overlay = local.crop((dx0 - sx0, dy0 - sy0, dx1 - sx0, dy1 - sy0))
-    else:
-        dx0 = max(0, math.floor(layout.bounds_mm[0] * scale) - 4)
-        dy0 = max(0, math.floor(layout.bounds_mm[1] * scale) - 4)
-        dx1 = min(sheet_w, math.ceil(layout.bounds_mm[2] * scale) + 4)
-        dy1 = min(sheet_h, math.ceil(layout.bounds_mm[3] * scale) + 4)
-        if dx1 <= dx0 or dy1 <= dy0:
-            return
-        theta = math.radians(float(ann.angle_deg))
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
-        coeffs = (
-            cos_t,
-            sin_t,
-            origin_x + (dx0 - ax_sheet) * cos_t + (dy0 - ay_sheet) * sin_t,
-            -sin_t,
-            cos_t,
-            origin_y - (dx0 - ax_sheet) * sin_t + (dy0 - ay_sheet) * cos_t,
-        )
-        overlay = local.transform(
-            (dx1 - dx0, dy1 - dy0),
-            Image.Transform.AFFINE,
-            coeffs,
-            resample=Image.Resampling.BICUBIC,
-        )
+        return local, (sx0, sy0)
 
+    dx0 = math.floor(layout.bounds_mm[0] * scale) - 4
+    dy0 = math.floor(layout.bounds_mm[1] * scale) - 4
+    dx1 = math.ceil(layout.bounds_mm[2] * scale) + 4
+    dy1 = math.ceil(layout.bounds_mm[3] * scale) + 4
+    theta = math.radians(float(ann.angle_deg))
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    coeffs = (
+        cos_t,
+        sin_t,
+        origin_x + (dx0 - ax_sheet) * cos_t + (dy0 - ay_sheet) * sin_t,
+        -sin_t,
+        cos_t,
+        origin_y - (dx0 - ax_sheet) * sin_t + (dy0 - ay_sheet) * cos_t,
+    )
+    overlay = local.transform(
+        (max(1, dx1 - dx0), max(1, dy1 - dy0)),
+        Image.Transform.AFFINE,
+        coeffs,
+        resample=Image.Resampling.BICUBIC,
+    )
+    return overlay, (dx0, dy0)
+
+
+def render_text_annotation_rgba(
+    layout: TextLayout, dpi: float = 150.0
+) -> tuple[Image.Image, tuple[float, float, float, float]]:
+    """Render one ``TextLayout`` to an RGBA bitmap with its A4 millimeter box ``(x, y, w, h)``."""
+    scale = float(dpi) / 25.4
+    overlay, (x0_px, y0_px) = _render_annotation_overlay(layout, dpi)
+    return overlay, (
+        x0_px / scale,
+        y0_px / scale,
+        overlay.width / scale,
+        overlay.height / scale,
+    )
+
+
+def _draw_text_annotation_pil(target: Image.Image, layout: TextLayout, dpi: float) -> None:
+    overlay, (sx0, sy0) = _render_annotation_overlay(layout, dpi)
+    sheet_w, sheet_h = target.size
+    dx0 = max(0, sx0)
+    dy0 = max(0, sy0)
+    dx1 = min(sheet_w, sx0 + overlay.width)
+    dy1 = min(sheet_h, sy0 + overlay.height)
+    if dx1 <= dx0 or dy1 <= dy0:
+        return
+    if (dx0, dy0, dx1, dy1) != (sx0, sy0, sx0 + overlay.width, sy0 + overlay.height):
+        overlay = overlay.crop((dx0 - sx0, dy0 - sy0, dx1 - sx0, dy1 - sy0))
     tile = target.crop((dx0, dy0, dx1, dy1)).convert("RGBA")
     composed = Image.alpha_composite(tile, overlay).convert("RGB")
     target.paste(composed, (dx0, dy0))

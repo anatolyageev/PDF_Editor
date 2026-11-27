@@ -1,9 +1,12 @@
 import secrets
+from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import (
     QByteArray,
+    QEvent,
     QMimeData,
     QSettings,
     QSize,
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -37,17 +41,20 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -60,9 +67,30 @@ from ..export import (
     export_sheet,
     fingerprint_file,
     render_sheet,
+    render_text_annotation_rgba,
     snapshot_sheet,
 )
-from ..geometry import CardSize, Layout, arrange, crop_marks, validate_quad
+from ..fonts import (
+    FONT_FAMILIES,
+    FONT_SPECS,
+    layout_text_annotation,
+    validate_text_glyphs,
+)
+from ..geometry import (
+    A4_HEIGHT_MM,
+    A4_WIDTH_MM,
+    ANGLE_MAX_DEG,
+    ANGLE_MIN_DEG,
+    FONT_SIZE_MAX_PT,
+    FONT_SIZE_MIN_PT,
+    CardSize,
+    Layout,
+    TextAnnotation,
+    arrange,
+    crop_marks,
+    validate_quad,
+    validate_text_bounds,
+)
 from ..imaging import (
     Source,
     detect_quad,
@@ -467,6 +495,12 @@ class MainWindow(QMainWindow):
         self._source_registry: dict[str, Source] = {}
         self._side_selection_seq = 0
         self._needs_contour_review: set[str] = set()
+        self.annotations: list[TextAnnotation] = []
+        self._annotation_id_seq = 0
+        self.selected_annotation_id: str | None = None
+        self._text_draft_error: str | None = None
+        self._text_dirty_for_history = False
+        self._date_provider = date.today
         self.history = UndoStack(WorkspaceSnapshot((), Layout()))
         self.checkpoints = WorkspaceCheckpoints(self.history.current)
         self.load_generation = {"front": 0, "back": 0}
@@ -493,12 +527,17 @@ class MainWindow(QMainWindow):
         self.layout_timer.setSingleShot(True)
         self.layout_timer.setInterval(160)
         self.layout_timer.timeout.connect(self.refresh_sheet)
+        self._text_commit_timer = QTimer(self)
+        self._text_commit_timer.setSingleShot(True)
+        self._text_commit_timer.setInterval(300)
+        self._text_commit_timer.timeout.connect(self._flush_text_history)
         self.statusBar().showMessage(
             "Добавьте изображения или PDF. Все документы обрабатываются на этом компьютере."
         )
         self.apply_theme(self.theme_name, persist=False)
         self._sync_controls()
         self._sync_side_slots()
+        self._sync_text_inspector()
         self._sync_context_panels()
         self._sync_history_controls()
         self._sync_dirty_ui()
@@ -577,10 +616,10 @@ class MainWindow(QMainWindow):
         self._save_shortcut = QShortcut(
             QKeySequence("Ctrl+S"), self, activated=lambda: self.pdf_button.click()
         )
-        self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
-        self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
+        self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self, activated=self._shortcut_undo)
+        self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self, activated=self._shortcut_redo)
         self._redo_shift_shortcut = QShortcut(
-            QKeySequence("Ctrl+Shift+Z"), self, activated=self.redo
+            QKeySequence("Ctrl+Shift+Z"), self, activated=self._shortcut_redo
         )
         splitter = QSplitter()
         self.splitter = splitter
@@ -721,7 +760,32 @@ class MainWindow(QMainWindow):
         self.preview.layoutDragStarted.connect(self.on_layout_drag_started)
         self.preview.layoutMoved.connect(self.on_layout_moved)
         self.preview.layoutDragFinished.connect(self.on_layout_drag_finished)
+        self.preview.annotationPlaceRequested.connect(self.place_text_at)
+        self.preview.annotationSelected.connect(self.select_annotation)
+        self.preview.annotationEditRequested.connect(self._focus_text_editor)
+        self.preview.annotationDragStarted.connect(self.on_annotation_drag_started)
+        self.preview.annotationMoved.connect(self.on_annotation_moved)
+        self.preview.annotationDragFinished.connect(self.on_annotation_drag_finished)
+        self.preview.annotationDeleteRequested.connect(self.delete_annotation)
+        self.preview.placingTextCancelled.connect(self._on_placing_text_cancelled)
         guides = QHBoxLayout()
+        self.add_text_button = self._button(
+            "Добавить текст",
+            self._toggle_place_text,
+            variant="secondary",
+            icon_name="text",
+            tooltip="Щёлкните на лист A4 для добавления текстовой надписи (Esc — отмена)",
+        )
+        self.add_text_button.setCheckable(True)
+        guides.addWidget(self.add_text_button)
+        self.watermark_button = self._button(
+            "Водяной знак",
+            self.add_watermark_preset,
+            variant="secondary",
+            icon_name="watermark",
+            tooltip="Добавить диагональный полупрозрачный водяной знак с текущей датой",
+        )
+        guides.addWidget(self.watermark_button)
         self.rulers_toggle = QCheckBox("Линейки · мм")
         self.guides_toggle = QCheckBox("Поля")
         for toggle in (self.rulers_toggle, self.guides_toggle):
@@ -736,7 +800,7 @@ class MainWindow(QMainWindow):
         preview_layout.addLayout(self.view_toolbar(self.preview))
         preview_note = QLabel(
             "A4 · 210 × 297 мм · белый фон RGB 255, 255, 255\n"
-            "Перетащите карточку — сдвинется вся группа. Привязка к центру: 0,8 мм. Esc — отмена."
+            "Перетащите карточку или надпись по листу. Двойной щелчок — редактировать текст; Delete — удалить."
         )
         preview_note.setWordWrap(True)
         set_widget_property(preview_note, "status", "muted")
@@ -817,6 +881,72 @@ class MainWindow(QMainWindow):
         form.addRow(note)
         controls_layout.addWidget(self.layout_group)
 
+        self.text_group = QGroupBox("Текст и водяной знак")
+        text_form = QFormLayout(self.text_group)
+        self.text_content = QPlainTextEdit()
+        self.text_content.setAccessibleName("Текст выбранной надписи")
+        self.text_content.setPlaceholderText("Выберите надпись на листе A4 или добавьте новую…")
+        self.text_content.setMaximumHeight(72)
+        self.text_content.installEventFilter(self)
+        text_form.addRow("Текст", self.text_content)
+        self.text_font = QComboBox()
+        self.text_font.setAccessibleName("Семейство шрифта надписи")
+        for fam in FONT_FAMILIES:
+            self.text_font.addItem(FONT_SPECS[fam].display_name, fam)
+        text_form.addRow("Шрифт", self.text_font)
+        self.text_align = QComboBox()
+        self.text_align.setAccessibleName("Выравнивание текста")
+        self.text_align.addItem("По левому краю", "left")
+        self.text_align.addItem("По центру", "center")
+        self.text_align.addItem("По правому краю", "right")
+        text_form.addRow("Выравнивание", self.text_align)
+        self.text_size = QDoubleSpinBox()
+        self.text_size.setRange(FONT_SIZE_MIN_PT, FONT_SIZE_MAX_PT)
+        self.text_size.setDecimals(1)
+        self.text_size.setSuffix(" pt")
+        self.text_size.setValue(14.0)
+        self.text_size.setKeyboardTracking(False)
+        self.text_size.setAccessibleName("Размер шрифта в пунктах")
+        text_form.addRow("Размер", self.text_size)
+        self.text_angle = QDoubleSpinBox()
+        self.text_angle.setRange(ANGLE_MIN_DEG, ANGLE_MAX_DEG)
+        self.text_angle.setDecimals(1)
+        self.text_angle.setSuffix("°")
+        self.text_angle.setValue(0.0)
+        self.text_angle.setKeyboardTracking(False)
+        self.text_angle.setAccessibleName("Угол поворота надписи в градусах")
+        text_form.addRow("Поворот", self.text_angle)
+        self.text_opacity = QDoubleSpinBox()
+        self.text_opacity.setRange(5.0, 100.0)
+        self.text_opacity.setDecimals(0)
+        self.text_opacity.setSuffix(" %")
+        self.text_opacity.setValue(100.0)
+        self.text_opacity.setKeyboardTracking(False)
+        self.text_opacity.setAccessibleName("Непрозрачность текста в процентах")
+        text_form.addRow("Прозрачность", self.text_opacity)
+        self.text_color_button = self._button(
+            "#111827",
+            self._pick_text_color,
+            variant="secondary",
+            tooltip="Выбрать цвет текста",
+            accessible_name="Цвет текста надписи",
+        )
+        text_form.addRow("Цвет", self.text_color_button)
+        self.text_delete_button = self._button(
+            "Удалить надпись",
+            self.delete_selected_annotation,
+            variant="danger",
+            icon_name="remove",
+            tooltip="Удалить выбранную текстовую надпись (Delete на листе)",
+        )
+        text_form.addRow(self.text_delete_button)
+        self.text_error_label = QLabel()
+        self.text_error_label.setWordWrap(True)
+        set_widget_property(self.text_error_label, "status", "error")
+        self.text_error_label.hide()
+        text_form.addRow(self.text_error_label)
+        controls_layout.addWidget(self.text_group)
+
         self.status_group = QGroupBox("Статус и экспорт")
         status_layout = QVBoxLayout(self.status_group)
         self.layout_message = QLabel("Назначьте стороны документа.")
@@ -857,6 +987,11 @@ class MainWindow(QMainWindow):
         self.crop_marks_toggle.toggled.connect(self.layout_options_changed)
         for spin in (self.gap, self.margin, self.offset_x, self.offset_y):
             spin.valueChanged.connect(self.layout_options_changed)
+        self.text_content.textChanged.connect(self._on_text_content_changed)
+        self.text_font.currentIndexChanged.connect(self._on_text_style_changed)
+        self.text_align.currentIndexChanged.connect(self._on_text_style_changed)
+        for spin in (self.text_size, self.text_angle, self.text_opacity):
+            spin.valueChanged.connect(self._on_text_style_changed)
 
     def _button(
         self,
@@ -961,8 +1096,41 @@ class MainWindow(QMainWindow):
     def _sync_context_panels(self, tab_index: int | None = None) -> None:
         index = self.tabs.currentIndex() if tab_index is None else tab_index
         in_preview = index == 1
+        if not in_preview and self.preview.placing_text:
+            self.preview.set_placing_text(False)
+            self.add_text_button.setChecked(False)
+        if not in_preview:
+            self._flush_text_history()
         self.card_group.setVisible(not in_preview)
         self.layout_group.setVisible(in_preview)
+        self.text_group.setVisible(in_preview)
+
+    def _focused_text_widget(self):
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QPlainTextEdit, QLineEdit, QTextEdit)):
+            return focused
+        return None
+
+    def _shortcut_undo(self) -> None:
+        widget = self._focused_text_widget()
+        if widget is not None:
+            widget.undo()
+            return
+        self._flush_text_history()
+        self.undo()
+
+    def _shortcut_redo(self) -> None:
+        widget = self._focused_text_widget()
+        if widget is not None:
+            widget.redo()
+            return
+        self._flush_text_history()
+        self.redo()
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "text_content", None) and event.type() == QEvent.Type.FocusOut:
+            self._flush_text_history()
+        return super().eventFilter(watched, event)
 
     def apply_theme(self, theme_name: str, *, persist: bool = True) -> ThemePalette:
         palette = get_palette(theme_name)
@@ -1586,12 +1754,19 @@ class MainWindow(QMainWindow):
             self.draft_message is not None
             or self.editor.is_drafting
             or self.preview.is_layout_dragging
+            or self.preview.is_text_dragging
+            or self.preview.placing_text
         )
 
     def _clear_draft(self) -> bool:
         had_draft = self.is_drafting()
         self.editor.cancel_draft(emit=False)
         self.preview.cancel_layout_drag(emit=False)
+        self.preview.cancel_text_drag(emit=False)
+        if self.preview.placing_text:
+            self.preview.set_placing_text(False)
+        if hasattr(self, "add_text_button"):
+            self.add_text_button.setChecked(False)
         self.draft_message = None
         self.draft_side = None
         return had_draft
@@ -1973,7 +2148,7 @@ class MainWindow(QMainWindow):
             self.redo_button.setToolTip("Нечего повторять (Ctrl+Y / Ctrl+Shift+Z)")
 
     def _record_history(self, label: str):
-        snap = WorkspaceSnapshot.from_state(self.cards, self.current_layout())
+        snap = WorkspaceSnapshot.from_state(self.cards, self.current_layout(), self.annotations)
         result = self.history.push(snap, label)
         self._sync_history_controls()
         self._sync_dirty_ui()
@@ -1990,6 +2165,7 @@ class MainWindow(QMainWindow):
     def undo(self):
         if self._closing or self._closed:
             return
+        self._flush_text_history()
         before_mem = self.history.evicted_for_memory_count
         step = self.history.undo()
         if step is None:
@@ -2006,6 +2182,7 @@ class MainWindow(QMainWindow):
     def redo(self):
         if self._closing or self._closed:
             return
+        self._flush_text_history()
         before_mem = self.history.evicted_for_memory_count
         step = self.history.redo()
         if step is None:
@@ -2020,6 +2197,9 @@ class MainWindow(QMainWindow):
         self._restore_snapshot(snapshot, f"Повторено{suffix}.{mem_note}")
 
     def _restore_snapshot(self, snapshot: WorkspaceSnapshot, status_message: str):
+        self._text_commit_timer.stop()
+        self._text_dirty_for_history = False
+        self._text_draft_error = None
         self._clear_draft()
         self.layout_timer.stop()
         for side in ("front", "back"):
@@ -2044,6 +2224,11 @@ class MainWindow(QMainWindow):
                 card.display_turns = old_card.display_turns
             restored[side] = card
         self.cards = restored
+        self.annotations = list(snapshot.annotations)
+        if self.selected_annotation_id is not None and all(
+            a.id != self.selected_annotation_id for a in self.annotations
+        ):
+            self.selected_annotation_id = self.annotations[-1].id if self.annotations else None
 
         self.syncing = True
         try:
@@ -2065,6 +2250,8 @@ class MainWindow(QMainWindow):
         self.refresh_inspectors()
         self.show_card()
         self._sync_side_slots()
+        self._sync_text_inspector()
+        self._sync_preview_annotations()
         self._refresh_source_badges()
         self._sync_history_controls()
         self._sync_dirty_ui()
@@ -2074,6 +2261,349 @@ class MainWindow(QMainWindow):
                 self.render_card(side, update_display=(card.display is None))
         else:
             self.refresh_sheet()
+
+    def _next_annotation_id(self) -> str:
+        self._annotation_id_seq += 1
+        return f"ann-{self._annotation_id_seq}"
+
+    def _find_annotation_index(self, ann_id: str | None) -> int:
+        if ann_id is None:
+            return -1
+        for idx, ann in enumerate(self.annotations):
+            if ann.id == ann_id:
+                return idx
+        return -1
+
+    def _selected_annotation(self) -> TextAnnotation | None:
+        idx = self._find_annotation_index(self.selected_annotation_id)
+        return self.annotations[idx] if idx >= 0 else None
+
+    def _toggle_place_text(self, checked: bool) -> None:
+        if self._closing or self._closed:
+            return
+        self._flush_text_history()
+        if checked:
+            self.tabs.setCurrentIndex(1)
+            self.preview.cancel_layout_drag(emit=False)
+            self.preview.cancel_text_drag(emit=False)
+            self.preview.set_placing_text(True)
+            self.draft_message = "Выберите место на листе A4 для добавления текста. Esc — отмена."
+            self.invalidate_sheet(self.draft_message, keep_preview=True)
+            self.statusBar().showMessage(self.draft_message)
+        else:
+            self.preview.set_placing_text(False)
+            self.draft_message = None
+            self.statusBar().showMessage("Режим добавления текста отменён.")
+            self.refresh_sheet()
+
+    def _on_placing_text_cancelled(self) -> None:
+        self.add_text_button.setChecked(False)
+        self.draft_message = None
+        self.statusBar().showMessage("Добавление текста отменено.")
+        self.refresh_sheet()
+
+    def place_text_at(self, x_mm: float, y_mm: float) -> TextAnnotation | None:
+        if self._closing or self._closed:
+            return None
+        self._flush_text_history()
+        self.add_text_button.setChecked(False)
+        self.preview.set_placing_text(False)
+        self.draft_message = None
+        self._text_draft_error = None
+        ann_id = self._next_annotation_id()
+        candidate = TextAnnotation(
+            id=ann_id,
+            text="Копия верна",
+            x_mm=round(max(8.0, min(float(x_mm), A4_WIDTH_MM - 50.0)), 2),
+            y_mm=round(max(12.0, min(float(y_mm), A4_HEIGHT_MM - 10.0)), 2),
+            font_family="sans",
+            font_size_pt=14.0,
+            color_hex="#111827",
+            angle_deg=0.0,
+            opacity=1.0,
+            align="left",
+            is_watermark=False,
+        )
+        self.annotations.append(candidate)
+        self.selected_annotation_id = ann_id
+        self._record_history("Добавление текста")
+        self._sync_preview_annotations()
+        self.preview.select_annotation(ann_id, emit=False)
+        self._sync_text_inspector()
+        self.statusBar().showMessage("Добавлена текстовая надпись. Двойной щелчок — редактировать.")
+        self.refresh_sheet()
+        return candidate
+
+    def add_watermark_preset(self) -> TextAnnotation | None:
+        if self._closing or self._closed:
+            return None
+        self._flush_text_history()
+        self.add_text_button.setChecked(False)
+        self.preview.set_placing_text(False)
+        self.draft_message = None
+        self._text_draft_error = None
+        stamp_date = self._date_provider().strftime("%d.%m.%Y")
+        ann_id = self._next_annotation_id()
+        preset = TextAnnotation(
+            id=ann_id,
+            text=f"КОПИЯ ВЕРНА\nТолько для предъявления · {stamp_date}",
+            x_mm=105.0,
+            y_mm=148.5,
+            font_family="sans-bold",
+            font_size_pt=20.0,
+            color_hex="#334155",
+            angle_deg=-30.0,
+            opacity=0.25,
+            align="center",
+            is_watermark=True,
+        )
+        self.tabs.setCurrentIndex(1)
+        self.annotations.append(preset)
+        self.selected_annotation_id = ann_id
+        self._record_history("Водяной знак")
+        self._sync_preview_annotations()
+        self.preview.select_annotation(ann_id, emit=False)
+        self._sync_text_inspector()
+        self.statusBar().showMessage(f"Добавлен водяной знак с датой {stamp_date}.")
+        self.refresh_sheet()
+        return preset
+
+    def select_annotation(self, ann_id: str | None) -> None:
+        self._flush_text_history()
+        if ann_id is not None and self._find_annotation_index(ann_id) < 0:
+            ann_id = None
+        self.selected_annotation_id = ann_id
+        self._text_draft_error = None
+        self.preview.select_annotation(ann_id, emit=False)
+        self._sync_text_inspector()
+
+    def _focus_text_editor(self, ann_id: str) -> None:
+        self.select_annotation(ann_id)
+        if self.selected_annotation_id is not None:
+            self.text_content.setFocus()
+            self.text_content.selectAll()
+
+    def delete_annotation(self, ann_id: str) -> None:
+        idx = self._find_annotation_index(ann_id)
+        if idx < 0:
+            return
+        self._text_commit_timer.stop()
+        self._text_dirty_for_history = False
+        self._text_draft_error = None
+        self.annotations.pop(idx)
+        if self.selected_annotation_id == ann_id:
+            self.selected_annotation_id = self.annotations[-1].id if self.annotations else None
+        self.preview.select_annotation(self.selected_annotation_id, emit=False)
+        self._record_history("Удаление текста")
+        self._sync_text_inspector()
+        self._sync_preview_annotations()
+        self.statusBar().showMessage("Текстовая надпись удалена.")
+        self.refresh_sheet()
+
+    def delete_selected_annotation(self) -> None:
+        if self.selected_annotation_id is not None:
+            self.delete_annotation(self.selected_annotation_id)
+
+    def _pick_text_color(self) -> None:
+        ann = self._selected_annotation()
+        if ann is None:
+            return
+        color = QColorDialog.getColor(QColor(ann.color_hex), self, "Выберите цвет текста")
+        if color.isValid():
+            self.set_annotation_color(color.name())
+
+    def set_annotation_color(self, color_hex: str) -> None:
+        idx = self._find_annotation_index(self.selected_annotation_id)
+        if idx < 0:
+            return
+        self._flush_text_history()
+        updated = replace(self.annotations[idx], color_hex=color_hex)
+        self.annotations[idx] = updated
+        self._record_history("Цвет текста")
+        self._sync_text_inspector()
+        self._sync_preview_annotations()
+        self.refresh_sheet()
+
+    def on_annotation_drag_started(self, ann_id: str) -> None:
+        self._flush_text_history()
+        self.select_annotation(ann_id)
+        self.draft_message = "Перемещение текстовой надписи… Esc — отмена."
+        self.draft_side = None
+        self.layout_timer.stop()
+        self.invalidate_sheet(self.draft_message, keep_preview=True)
+
+    def on_annotation_moved(self, ann_id: str, x_mm: float, y_mm: float) -> None:
+        idx = self._find_annotation_index(ann_id)
+        if idx < 0:
+            return
+        self.annotations[idx] = replace(
+            self.annotations[idx], x_mm=round(x_mm, 2), y_mm=round(y_mm, 2)
+        )
+        self._sync_dirty_ui()
+
+    def on_annotation_drag_finished(self, ann_id: str, changed: bool) -> None:
+        self.draft_message = None
+        self.draft_side = None
+        if changed:
+            self._record_history("Перемещение текста")
+        self._sync_preview_annotations()
+        self.refresh_sheet()
+
+    def _on_text_content_changed(self) -> None:
+        if self.syncing or self._closing or self._closed:
+            return
+        idx = self._find_annotation_index(self.selected_annotation_id)
+        if idx < 0:
+            return
+        current = self.annotations[idx]
+        new_text = self.text_content.toPlainText()
+        if not new_text.strip():
+            self._text_draft_error = "Текст надписи не должен быть пустым."
+            self._sync_text_inspector()
+            self.refresh_sheet()
+            return
+        try:
+            validate_text_glyphs(new_text, current.font_family)
+            updated = replace(current, text=new_text)
+        except ValueError as exc:
+            self._text_draft_error = str(exc)
+            self._sync_text_inspector()
+            self.refresh_sheet()
+            return
+        self._text_draft_error = None
+        if updated != current:
+            self.annotations[idx] = updated
+            self._text_dirty_for_history = True
+            self._text_commit_timer.start()
+            self._sync_dirty_ui()
+            self._sync_text_inspector(update_text=False)
+            self._sync_preview_annotations()
+            self.refresh_sheet()
+
+    def _on_text_style_changed(self) -> None:
+        if self.syncing or self._closing or self._closed:
+            return
+        idx = self._find_annotation_index(self.selected_annotation_id)
+        if idx < 0:
+            return
+        self._flush_text_history()
+        current = self.annotations[idx]
+        family = self.text_font.currentData() or current.font_family
+        align = self.text_align.currentData() or current.align
+        size_pt = float(self.text_size.value())
+        angle_deg = float(self.text_angle.value())
+        opacity = round(float(self.text_opacity.value()) / 100.0, 2)
+        try:
+            validate_text_glyphs(current.text, family)
+            updated = replace(
+                current,
+                font_family=family,
+                align=align,
+                font_size_pt=size_pt,
+                angle_deg=angle_deg,
+                opacity=opacity,
+            )
+        except ValueError as exc:
+            self._text_draft_error = str(exc)
+            self._sync_text_inspector()
+            self.refresh_sheet()
+            return
+        self._text_draft_error = None
+        if updated != current:
+            self.annotations[idx] = updated
+            self._record_history("Оформление текста")
+            self._sync_text_inspector()
+            self._sync_preview_annotations()
+            self.refresh_sheet()
+
+    def _flush_text_history(self) -> None:
+        self._text_commit_timer.stop()
+        if self._text_dirty_for_history:
+            self._text_dirty_for_history = False
+            self._record_history("Изменение текста")
+
+    def _sync_text_inspector(self, *, update_text: bool = True) -> None:
+        ann = self._selected_annotation()
+        has_ann = ann is not None
+        for widget in (
+            self.text_content,
+            self.text_font,
+            self.text_align,
+            self.text_size,
+            self.text_angle,
+            self.text_opacity,
+            self.text_color_button,
+            self.text_delete_button,
+        ):
+            widget.setEnabled(has_ann)
+        self.syncing = True
+        try:
+            if ann is not None:
+                if update_text and self.text_content.toPlainText() != ann.text:
+                    self.text_content.setPlainText(ann.text)
+                fam_idx = self.text_font.findData(ann.font_family)
+                if fam_idx >= 0:
+                    self.text_font.setCurrentIndex(fam_idx)
+                align_idx = self.text_align.findData(ann.align)
+                if align_idx >= 0:
+                    self.text_align.setCurrentIndex(align_idx)
+                self.text_size.setValue(ann.font_size_pt)
+                self.text_angle.setValue(ann.angle_deg)
+                self.text_opacity.setValue(round(ann.opacity * 100.0))
+                self.text_color_button.setText(ann.color_hex.upper())
+            else:
+                if update_text:
+                    self.text_content.clear()
+                self.text_color_button.setText("#111827")
+        finally:
+            self.syncing = False
+        err = self._text_draft_error or self._validate_annotations_error()
+        if err:
+            self.text_error_label.setText(f"✕ {err}")
+            self.text_error_label.show()
+        else:
+            self.text_error_label.clear()
+            self.text_error_label.hide()
+
+    def _validate_annotations(
+        self,
+    ) -> tuple[dict[str, object], dict[str, bool], str | None]:
+        layouts: dict[str, object] = {}
+        valid_map: dict[str, bool] = {}
+        first_error: str | None = self._text_draft_error
+        for ann in self.annotations:
+            try:
+                layout = layout_text_annotation(ann, validate_bounds=False)
+            except ValueError as exc:
+                valid_map[ann.id] = False
+                if first_error is None:
+                    first_error = str(exc)
+                continue
+            layouts[ann.id] = layout
+            try:
+                validate_text_bounds(layout)
+            except ValueError as exc:
+                valid_map[ann.id] = False
+                if first_error is None:
+                    first_error = str(exc)
+            else:
+                valid_map[ann.id] = True
+        return layouts, valid_map, first_error
+
+    def _validate_annotations_error(self) -> str | None:
+        return self._validate_annotations()[2]
+
+    def _sync_preview_annotations(self) -> None:
+        layouts, valid_map, _ = self._validate_annotations()
+        rendered = {
+            ann_id: render_text_annotation_rgba(lay, dpi=150.0) for ann_id, lay in layouts.items()
+        }
+        self.preview.set_annotations(
+            self.annotations,
+            layouts=layouts,
+            rendered=rendered,
+            valid_map=valid_map,
+        )
 
     def layout_changed(self):
         if self.syncing or self._closing or self._closed:
@@ -2091,10 +2621,12 @@ class MainWindow(QMainWindow):
     def refresh_sheet(self):
         if self._closing or self._closed:
             return
-        if self.preview.is_layout_dragging:
+        if self.preview.is_layout_dragging or self.preview.is_text_dragging:
             return
         if self.is_drafting():
-            self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
+            self.invalidate_sheet(
+                self.draft_message or "Редактирование выделения…", keep_preview=True
+            )
             self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
             return
         if self.pending_loads:
@@ -2108,10 +2640,27 @@ class MainWindow(QMainWindow):
             set_widget_property(self.layout_message, "status", "error")
             self.tabs.setTabText(1, "Предпросмотр A4 · исправьте выделение")
             return
+        layouts, valid_map, text_error = self._validate_annotations()
         if not self.cards:
             self.invalidate_sheet("Назначьте стороны документа.")
             self.preview.clear_sheet()
+            self._sync_preview_annotations()
             self.tabs.setTabText(1, "Предпросмотр A4")
+            return
+        if text_error is not None:
+            rendered = {
+                ann_id: render_text_annotation_rgba(lay, dpi=150.0)
+                for ann_id, lay in layouts.items()
+            }
+            self.preview.set_annotations(
+                self.annotations,
+                layouts=layouts,
+                rendered=rendered,
+                valid_map=valid_map,
+            )
+            self.invalidate_sheet(f"✕ {text_error}", keep_preview=True)
+            set_widget_property(self.layout_message, "status", "error")
+            self.tabs.setTabText(1, "Предпросмотр A4 · исправьте текст")
             return
         if any(card.ready_revision != card.revision for card in self.cards.values()):
             return
@@ -2126,6 +2675,7 @@ class MainWindow(QMainWindow):
                 {side: card.rendered for side, card in self.cards.items()},
                 placements,
                 crop_marks=layout.crop_marks,
+                annotations=tuple(self.annotations),
             )
         except ValueError as exc:
             self.layout_message.setText(f"✕ {exc}")
@@ -2133,7 +2683,18 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(1, "Предпросмотр A4 · не помещается")
             return
 
-        def done(preview):
+        def preview_work():
+            base_preview = render_sheet(
+                Sheet(sheet.images, sheet.placements, crop_marks=sheet.crop_marks),
+                dpi=120,
+            )
+            overlays = {
+                ann_id: render_text_annotation_rgba(lay, dpi=150.0)
+                for ann_id, lay in layouts.items()
+            }
+            return base_preview, overlays
+
+        def done(result):
             if (
                 self._closing
                 or self._closed
@@ -2141,8 +2702,15 @@ class MainWindow(QMainWindow):
                 or self.is_drafting()
             ):
                 return
+            base_preview, overlays = result
             self.sheet = sheet
-            self.preview.set_sheet(preview, sheet.placements, layout)
+            self.preview.set_sheet(base_preview, sheet.placements, layout)
+            self.preview.set_annotations(
+                sheet.annotations,
+                layouts=layouts,
+                rendered=overlays,
+                valid_map=valid_map,
+            )
             self.preview.setEnabled(True)
             self.pdf_button.setEnabled(True)
             self.png_button.setEnabled(True)
@@ -2174,7 +2742,7 @@ class MainWindow(QMainWindow):
                 )
             )
 
-        self.submit(lambda: render_sheet(sheet), done)
+        self.submit(preview_work, done)
 
     def is_inspector_fresh(
         self, side: str, card: Card, revision: int, load_gen: int, request_id: int
@@ -2254,7 +2822,7 @@ class MainWindow(QMainWindow):
                 )
 
     def current_workspace_snapshot(self) -> WorkspaceSnapshot:
-        return WorkspaceSnapshot.from_state(self.cards, self.current_layout())
+        return WorkspaceSnapshot.from_state(self.cards, self.current_layout(), self.annotations)
 
     def can_export_now(self) -> bool:
         return bool(self.sheet is not None and not self.is_drafting() and not self.pending_loads)
@@ -2314,6 +2882,7 @@ class MainWindow(QMainWindow):
         return "cancel"
 
     def save(self, kind, *, close_on_success: bool = False) -> bool:
+        self._flush_text_history()
         if self.is_drafting():
             self._pending_close_after_export = False
             self.show_error("Завершите выделение или нажмите Esc для отмены перед экспортом.")

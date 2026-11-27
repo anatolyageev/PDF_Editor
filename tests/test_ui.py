@@ -1974,3 +1974,185 @@ def test_a4_guides_are_view_only_crop_marks_undo_and_captured_export(
     assert len(window.preview.mark_items) == len(omitted.segments)
     assert window.pdf_button.isEnabled()
     window.close()
+
+
+def test_a4_text_click_to_place_watermark_date_capture_and_export(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    from datetime import date
+
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda parent, title, msg: errors.append((title, msg))
+    )
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    window.tabs.setCurrentIndex(1)
+    QApplication.processEvents()
+    assert window.text_group.isVisible()
+
+    # Click-to-place text on A4 sheet via toolbar toggle + viewport click.
+    qtbot.mouseClick(window.add_text_button, Qt.MouseButton.LeftButton)
+    assert window.preview.placing_text
+    assert not window.pdf_button.isEnabled()
+    pos = window.preview.mapFromScene(QPointF(105.0, 35.0))
+    qtbot.mouseClick(window.preview.viewport(), Qt.MouseButton.LeftButton, pos=pos)
+    controller.drain()
+    assert len(window.annotations) == 1
+    assert not window.preview.placing_text
+    assert window.preview.selected_annotation_id == window.annotations[0].id
+    assert window.annotations[0].id in window.preview.annotation_items
+    assert "Копия верна" in window.text_content.toPlainText()
+
+    # Edit text, font, align, size, angle, opacity, and color via inspector controls.
+    window.text_content.setPlainText("Для предъявления\nЛист 1")
+    window._flush_text_history()
+    window.text_font.setCurrentIndex(window.text_font.findData("serif"))
+    window.text_align.setCurrentIndex(window.text_align.findData("center"))
+    window.text_size.setValue(18.0)
+    window.text_angle.setValue(-12.0)
+    window.text_opacity.setValue(75.0)
+    window.set_annotation_color("#1d4ed8")
+    controller.drain()
+
+    edited = window.annotations[0]
+    assert edited.text == "Для предъявления\nЛист 1"
+    assert edited.font_family == "serif"
+    assert edited.align == "center"
+    assert edited.font_size_pt == 18.0
+    assert edited.angle_deg == -12.0
+    assert edited.opacity == pytest.approx(0.75)
+    assert edited.color_hex == "#1d4ed8"
+
+    # Watermark preset captures date once at insertion time even if date advances later.
+    current_day = date(2026, 11, 27)
+    window._date_provider = lambda: current_day
+    qtbot.mouseClick(window.watermark_button, Qt.MouseButton.LeftButton)
+    controller.drain()
+    assert len(window.annotations) == 2
+    wm = window.annotations[1]
+    assert wm.is_watermark
+    assert "27.11.2026" in wm.text
+    current_day = date(2026, 11, 28)
+    assert "27.11.2026" in window.annotations[1].text and "28.11.2026" not in wm.text
+
+    # Export PDF & PNG: selectable Cyrillic text + watermark date preserved in both outputs.
+    assert window.sheet is not None
+    assert not errors
+    out_pdf = tmp_path / "with_text.pdf"
+    out_png = tmp_path / "with_text.png"
+    for kind, target in (("pdf", out_pdf), ("png", out_png)):
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, p=target, **kw: (str(p), ""))
+        assert window.save(kind)
+        controller.drain()
+    assert not errors
+
+    with pymupdf.open(out_pdf) as doc:
+        text = doc[0].get_text()
+        assert "Для предъявления" in text
+        assert "Лист 1" in text
+        assert "27.11.2026" in text
+    assert out_png.exists()
+    with Image.open(out_png) as png_img:
+        assert png_img.getpixel((0, 0)) == (255, 255, 255)
+    window.close()
+
+
+def test_a4_text_drag_double_click_delete_undo_redo_and_bounds_blocking(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    window.tabs.setCurrentIndex(1)
+    window.preview.fit_image()
+    QApplication.processEvents()
+
+    ann = window.place_text_at(45.0, 50.0)
+    assert ann is not None
+    controller.drain()
+    orig_x, orig_y = window.annotations[0].x_mm, window.annotations[0].y_mm
+    depth_before_drag = window.history.undo_depth
+
+    # Drag text annotation interactively by +25 mm X, +30 mm Y -> pushes 1 Undo step.
+    lay = window.preview.annotation_layouts[ann.id]
+    cx = (lay.bounds_mm[0] + lay.bounds_mm[2]) / 2
+    cy = (lay.bounds_mm[1] + lay.bounds_mm[3]) / 2
+    start_vp = window.preview.mapFromScene(QPointF(cx, cy))
+    end_vp = window.preview.mapFromScene(QPointF(cx + 25.0, cy + 30.0))
+
+    qtbot.mousePress(window.preview.viewport(), Qt.MouseButton.LeftButton, pos=start_vp)
+    assert window.preview.is_text_dragging
+    assert window.is_drafting() and not window.pdf_button.isEnabled()
+    qtbot.mouseMove(window.preview.viewport(), end_vp)
+    qtbot.mouseRelease(window.preview.viewport(), Qt.MouseButton.LeftButton, pos=end_vp)
+    controller.drain()
+
+    moved_x, moved_y = window.annotations[0].x_mm, window.annotations[0].y_mm
+    assert moved_x == pytest.approx(orig_x + 25.0, abs=1.5)
+    assert moved_y == pytest.approx(orig_y + 30.0, abs=1.5)
+    assert window.history.undo_depth == depth_before_drag + 1
+    assert window.pdf_button.isEnabled()
+
+    # Undo/Redo restores and re-applies moved position cleanly.
+    window.undo()
+    controller.drain()
+    assert window.annotations[0].x_mm == pytest.approx(orig_x, abs=0.05)
+    window.redo()
+    controller.drain()
+    assert window.annotations[0].x_mm == pytest.approx(moved_x, abs=0.05)
+
+    # Double-clicking the annotation selects it and focuses right-panel text editor.
+    lay2 = window.preview.annotation_layouts[ann.id]
+    cx2 = (lay2.bounds_mm[0] + lay2.bounds_mm[2]) / 2
+    cy2 = (lay2.bounds_mm[1] + lay2.bounds_mm[3]) / 2
+    dbl_pos = window.preview.mapFromScene(QPointF(cx2, cy2))
+    qtbot.mouseDClick(window.preview.viewport(), Qt.MouseButton.LeftButton, pos=dbl_pos)
+    assert window.text_content.hasFocus()
+
+    # Making an annotation go out of A4 bounds blocks export cleanly until fixed or undone.
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: warnings.append(a[-1]))
+    window.text_size.setValue(96.0)
+    window.text_content.setPlainText("Очень длинная строка текста выходящая за лист")
+    window._flush_text_history()
+    controller.drain()
+    assert window.sheet is None
+    assert not window.pdf_button.isEnabled()
+    assert "выходит за пределы" in window.layout_message.text()
+    assert not window.save("pdf")
+    assert warnings
+
+    # Undo back to valid state re-enables export.
+    window.undo()
+    window.undo()
+    controller.drain()
+    assert window.sheet is not None and window.pdf_button.isEnabled()
+
+    # Pressing Delete while SheetView has focus deletes the selected annotation; Undo restores it.
+    window.preview.setFocus()
+    qtbot.keyClick(window.preview, Qt.Key.Key_Delete)
+    controller.drain()
+    assert not window.annotations
+    window.undo()
+    controller.drain()
+    assert len(window.annotations) == 1
+    window.close()
+
+
+def test_text_inspector_retains_native_typing_shortcuts(qtbot, tmp_path, synthetic_card):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    window.tabs.setCurrentIndex(1)
+    ann = window.place_text_at(40.0, 40.0)
+    assert ann is not None
+    controller.drain()
+    depth_after_place = window.history.undo_depth
+
+    window.text_content.setFocus()
+    qtbot.waitUntil(window.text_content.hasFocus, timeout=2000)
+    # Type via Qt key events inside QPlainTextEdit and invoke Ctrl+Z / Delete natively.
+    qtbot.keyClicks(window.text_content, " 123")
+    window._shortcut_undo()
+    qtbot.keyClick(window.text_content, Qt.Key.Key_Delete)
+
+    # Selected annotation was NOT deleted and workspace Undo stack was NOT popped.
+    assert len(window.annotations) == 1
+    assert window.history.undo_depth >= depth_after_place
+    window.close()

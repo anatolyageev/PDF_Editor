@@ -51,8 +51,8 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 | `T-03` | M1 · Foundation & UX | Add drag-and-drop import, visual Front/Back slot cards, and source badges | `DONE` | `T-02` |
 | `T-04` | M1 · Foundation & UX | Upgrade corner editor UX (mask, numbered handles, live error, loupe, shortcuts) | `DONE` | `T-02`, `T-18`, `T-19` |
 | `T-06` | M1 · Foundation & UX | Upgrade A4 preview (mm rulers, margin guides, crop marks, drag-to-offset) | `DONE` | `T-02`, `T-05` |
-| `T-07` | M2 · Text on A4 | Add Cyrillic TTF font resolver (`fonts.py`), `TextAnnotation`, and shared text export | `TODO` | `T-01`, `T-19` |
-| `T-08` | M2 · Text on A4 | Add interactive A4 text & watermark editing UI with presets and Undo/Redo | `TODO` | `T-05`, `T-06`, `T-07` |
+| `T-07` | M2 · Text on A4 | Add Cyrillic TTF font resolver (`fonts.py`), `TextAnnotation`, and shared text export | `DONE` | `T-01`, `T-19` |
+| `T-08` | M2 · Text on A4 | Add interactive A4 text & watermark editing UI with presets and Undo/Redo | `DONE` | `T-05`, `T-06`, `T-07` |
 | `T-09` | M3 · PDF Editor Mode | Add dual-mode workspace shell using shared save guards | `TODO` | `T-02`, `T-20`, `T-21` |
 | `T-10` | M3 · PDF Editor Mode | Implement PDF Editor core engine (`pdf_editor.py`) for vector Cyrillic text | `TODO` | `T-07`, `T-09`, `T-19` |
 | `T-11` | M3 · PDF Editor Mode | Implement PDF Editor UI (`ui/pdf_view.py`) for viewing, writing text, and saving PDFs | `TODO` | `T-10`, `T-05`, `T-20` |
@@ -288,7 +288,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-08`: Add interactive A4 text & watermark editing UI with presets and Undo/Redo
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-05`, `T-06`, `T-07`
 - **Goal:** Allow users to add, position, rotate, style, and remove Russian captions or semi-transparent watermarks directly on the A4 preview tab.
 - **Target files:**

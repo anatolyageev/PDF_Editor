@@ -1,3 +1,4 @@
+from dataclasses import replace
 from math import floor
 
 import numpy as np
@@ -25,10 +26,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..export import render_text_annotation_rgba
+from ..fonts import layout_text_annotation
 from ..geometry import (
     A4_HEIGHT_MM,
     A4_WIDTH_MM,
     Layout,
+    TextAnnotation,
+    TextLayout,
     ViewTransform,
     arrange,
     crop_marks,
@@ -533,8 +538,31 @@ class SheetView(ImageView):
     layoutDragStarted = Signal()
     layoutMoved = Signal(object)
     layoutDragFinished = Signal(bool)
+    annotationPlaceRequested = Signal(float, float)
+    annotationSelected = Signal(object)
+    annotationEditRequested = Signal(str)
+    annotationDragStarted = Signal(str)
+    annotationMoved = Signal(str, float, float)
+    annotationDragFinished = Signal(str, bool)
+    annotationDeleteRequested = Signal(str)
+    placingTextCancelled = Signal()
 
     def __init__(self, parent=None):
+        self.annotations: list[TextAnnotation] = []
+        self.annotation_layouts: dict[str, TextLayout] = {}
+        self.annotation_renders: dict[
+            str, tuple[Image.Image, tuple[float, float, float, float]]
+        ] = {}
+        self.annotation_items: dict[str, QGraphicsPixmapItem] = {}
+        self.annotation_valid: dict[str, bool] = {}
+        self.selected_annotation_id: str | None = None
+        self.placing_text: bool = False
+        self._text_drag_id: str | None = None
+        self._text_drag_start: QPointF | None = None
+        self._text_drag_origin: TextAnnotation | None = None
+        self._text_drag_origin_layout: TextLayout | None = None
+        self._text_drag_current: TextAnnotation | None = None
+        self._text_drag_base_pos: QPointF | None = None
         super().__init__(parent=parent)
         self.rulers_visible = True
         self.guides_visible = True
@@ -551,15 +579,109 @@ class SheetView(ImageView):
         return self._drag_start is not None
 
     @property
+    def is_text_dragging(self) -> bool:
+        return self._text_drag_id is not None
+
+    @property
     def committed_layout(self):
         return self._drag_layout if self.is_layout_dragging else self.sheet_layout
 
+    def set_placing_text(self, active: bool) -> None:
+        self.placing_text = bool(active)
+        if self.placing_text:
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.viewport().unsetCursor()
+
+    def select_annotation(self, ann_id: str | None, *, emit: bool = True) -> None:
+        if ann_id is not None and all(a.id != ann_id for a in self.annotations):
+            ann_id = None
+        if self.selected_annotation_id == ann_id:
+            return
+        self.selected_annotation_id = ann_id
+        self.viewport().update()
+        if emit:
+            self.annotationSelected.emit(ann_id)
+
+    def _rebuild_annotation_items(self) -> None:
+        for item in self.annotation_items.values():
+            if item.scene() is self.scene():
+                self.scene().removeItem(item)
+        self.annotation_items = {}
+        for idx, ann in enumerate(self.annotations):
+            rendered = self.annotation_renders.get(ann.id)
+            if rendered is None:
+                continue
+            rgba, (x0_mm, y0_mm, w_mm, h_mm) = rendered
+            if rgba.width <= 0 or rgba.height <= 0 or w_mm <= 0 or h_mm <= 0:
+                continue
+            qimg = QImage(
+                rgba.tobytes("raw", "RGBA"),
+                rgba.width,
+                rgba.height,
+                rgba.width * 4,
+                QImage.Format.Format_RGBA8888,
+            ).copy()
+            item = QGraphicsPixmapItem(QPixmap.fromImage(qimg))
+            item.setTransform(QTransform.fromScale(w_mm / rgba.width, h_mm / rgba.height))
+            item.setPos(x0_mm, y0_mm)
+            item.setZValue(3 + idx)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.scene().addItem(item)
+            self.annotation_items[ann.id] = item
+
+    def set_annotations(
+        self,
+        annotations: list[TextAnnotation] | tuple[TextAnnotation, ...],
+        *,
+        layouts: dict[str, TextLayout] | None = None,
+        rendered: dict[str, tuple[Image.Image, tuple[float, float, float, float]]] | None = None,
+        valid_map: dict[str, bool] | None = None,
+    ) -> None:
+        self.cancel_text_drag(emit=False)
+        self.annotations = list(annotations)
+        self.annotation_layouts = {}
+        self.annotation_renders = {}
+        self.annotation_valid = {}
+        for ann in self.annotations:
+            layout = layouts.get(ann.id) if layouts is not None else None
+            if layout is None:
+                try:
+                    layout = layout_text_annotation(ann, validate_bounds=False)
+                except ValueError:
+                    self.annotation_valid[ann.id] = False
+                    continue
+            self.annotation_layouts[ann.id] = layout
+            if valid_map is not None and ann.id in valid_map:
+                self.annotation_valid[ann.id] = valid_map[ann.id]
+            else:
+                min_x, min_y, max_x, max_y = layout.bounds_mm
+                self.annotation_valid[ann.id] = (
+                    min_x >= -1e-6
+                    and min_y >= -1e-6
+                    and max_x <= A4_WIDTH_MM + 1e-6
+                    and max_y <= A4_HEIGHT_MM + 1e-6
+                )
+            render_entry = rendered.get(ann.id) if rendered is not None else None
+            if render_entry is None:
+                render_entry = render_text_annotation_rgba(layout, dpi=150.0)
+            self.annotation_renders[ann.id] = render_entry
+        if self.selected_annotation_id is not None and all(
+            a.id != self.selected_annotation_id for a in self.annotations
+        ):
+            self.selected_annotation_id = None
+        self._rebuild_annotation_items()
+        self.viewport().update()
+
     def clear_sheet(self):
         self.cancel_layout_drag(emit=False)
+        self.cancel_text_drag(emit=False)
         self.card_items = {}
         self.mark_items = []
+        self.annotation_items = {}
         self.placements = []
         self.set_image(Image.new("RGB", (210, 297), "white"), (A4_WIDTH_MM, A4_HEIGHT_MM))
+        self._rebuild_annotation_items()
 
     def set_sheet(self, image, placements, layout):
         preserve_view = bool(self.placements) and not self.auto_fit
@@ -625,27 +747,114 @@ class SheetView(ImageView):
         self.layoutMoved.emit(layout)
         self.viewport().update()
 
+    def _hit_annotation(self, point: QPointF) -> TextAnnotation | None:
+        for ann in reversed(self.annotations):
+            layout = self.annotation_layouts.get(ann.id)
+            if layout is None:
+                continue
+            poly = QPolygonF([QPointF(*pt) for pt in layout.quad_mm])
+            if poly.containsPoint(point, Qt.FillRule.OddEvenFill):
+                return ann
+        return None
+
+    @staticmethod
+    def _shifted_layout(layout: TextLayout, dx: float, dy: float) -> TextLayout:
+        shifted_ann = replace(
+            layout.annotation,
+            x_mm=round(layout.annotation.x_mm + dx, 2),
+            y_mm=round(layout.annotation.y_mm + dy, 2),
+        )
+        shifted_quad = tuple((x + dx, y + dy) for x, y in layout.quad_mm)
+        min_x, min_y, max_x, max_y = layout.bounds_mm
+        return replace(
+            layout,
+            annotation=shifted_ann,
+            quad_mm=shifted_quad,
+            bounds_mm=(min_x + dx, min_y + dy, max_x + dx, max_y + dy),
+        )
+
     def mousePressEvent(self, event):
         point = QPointF(*self.viewport_to_source(event.position()))
         on_ruler = self.rulers_visible and (event.position().x() < 28 or event.position().y() < 24)
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and not on_ruler
-            and any(
+        if event.button() == Qt.MouseButton.LeftButton and not on_ruler:
+            if self.placing_text:
+                x = round(max(5.0, min(point.x(), A4_WIDTH_MM - 5.0)), 2)
+                y = round(max(10.0, min(point.y(), A4_HEIGHT_MM - 10.0)), 2)
+                self.set_placing_text(False)
+                self.setFocus()
+                self.annotationPlaceRequested.emit(x, y)
+                event.accept()
+                return
+            hit_ann = self._hit_annotation(point)
+            if hit_ann is not None and hit_ann.id in self.annotation_items:
+                self.select_annotation(hit_ann.id)
+                self._text_drag_id = hit_ann.id
+                self._text_drag_start = point
+                self._text_drag_origin = hit_ann
+                self._text_drag_origin_layout = self.annotation_layouts.get(hit_ann.id)
+                self._text_drag_current = hit_ann
+                self._text_drag_base_pos = self.annotation_items[hit_ann.id].pos()
+                self.setFocus()
+                self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.annotationDragStarted.emit(hit_ann.id)
+                event.accept()
+                return
+            self.select_annotation(None)
+            if any(
                 QRectF(p.x_mm, p.y_mm, p.width_mm, p.height_mm).contains(point)
                 for p in self.placements
-            )
-        ):
-            self._drag_start = point
-            self._drag_layout = self.sheet_layout
-            self.setFocus()
-            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
-            self.layoutDragStarted.emit()
-            event.accept()
-            return
+            ):
+                self._drag_start = point
+                self._drag_layout = self.sheet_layout
+                self.setFocus()
+                self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.layoutDragStarted.emit()
+                event.accept()
+                return
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        point = QPointF(*self.viewport_to_source(event.position()))
+        on_ruler = self.rulers_visible and (event.position().x() < 28 or event.position().y() < 24)
+        if event.button() == Qt.MouseButton.LeftButton and not on_ruler:
+            hit_ann = self._hit_annotation(point)
+            if hit_ann is not None:
+                self.cancel_text_drag(emit=False)
+                self.select_annotation(hit_ann.id)
+                self.annotationEditRequested.emit(hit_ann.id)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event):
+        if self.is_text_dragging:
+            ann_id = self._text_drag_id
+            delta = QPointF(*self.viewport_to_source(event.position())) - self._text_drag_start
+            origin = self._text_drag_origin
+            new_x = round(origin.x_mm + delta.x(), 2)
+            new_y = round(origin.y_mm + delta.y(), 2)
+            dx = new_x - origin.x_mm
+            dy = new_y - origin.y_mm
+            item = self.annotation_items.get(ann_id)
+            if item is not None and self._text_drag_base_pos is not None:
+                item.setPos(self._text_drag_base_pos.x() + dx, self._text_drag_base_pos.y() + dy)
+            if self._text_drag_origin_layout is not None:
+                shifted = self._shifted_layout(self._text_drag_origin_layout, dx, dy)
+                self.annotation_layouts[ann_id] = shifted
+                min_x, min_y, max_x, max_y = shifted.bounds_mm
+                self.annotation_valid[ann_id] = (
+                    min_x >= -1e-6
+                    and min_y >= -1e-6
+                    and max_x <= A4_WIDTH_MM + 1e-6
+                    and max_y <= A4_HEIGHT_MM + 1e-6
+                )
+                self._text_drag_current = shifted.annotation
+            else:
+                self._text_drag_current = replace(origin, x_mm=new_x, y_mm=new_y)
+            self.annotationMoved.emit(ann_id, new_x, new_y)
+            self.viewport().update()
+            event.accept()
+            return
         if self.is_layout_dragging:
             delta = QPointF(*self.viewport_to_source(event.position())) - self._drag_start
             sizes = {p.side: (p.width_mm, p.height_mm) for p in self.placements}
@@ -662,6 +871,24 @@ class SheetView(ImageView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self.is_text_dragging and event.button() == Qt.MouseButton.LeftButton:
+            self.mouseMoveEvent(event)
+            ann_id = self._text_drag_id
+            changed = (
+                self._text_drag_current is not None
+                and self._text_drag_current != self._text_drag_origin
+            )
+            self._text_drag_id = None
+            self._text_drag_start = None
+            self._text_drag_origin = None
+            self._text_drag_origin_layout = None
+            self._text_drag_current = None
+            self._text_drag_base_pos = None
+            self.viewport().unsetCursor()
+            self.annotationDragFinished.emit(ann_id, changed)
+            self.viewport().update()
+            event.accept()
+            return
         if self.is_layout_dragging and event.button() == Qt.MouseButton.LeftButton:
             self.mouseMoveEvent(event)
             changed = self.sheet_layout != self._drag_layout
@@ -672,6 +899,39 @@ class SheetView(ImageView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def cancel_text_drag(self, *, emit: bool = True) -> bool:
+        if not self.is_text_dragging:
+            return False
+        ann_id = self._text_drag_id
+        origin = self._text_drag_origin
+        origin_layout = self._text_drag_origin_layout
+        base_pos = self._text_drag_base_pos
+        self._text_drag_id = None
+        self._text_drag_start = None
+        self._text_drag_origin = None
+        self._text_drag_origin_layout = None
+        self._text_drag_current = None
+        self._text_drag_base_pos = None
+        item = self.annotation_items.get(ann_id)
+        if item is not None and base_pos is not None:
+            item.setPos(base_pos)
+        if origin_layout is not None:
+            self.annotation_layouts[ann_id] = origin_layout
+            min_x, min_y, max_x, max_y = origin_layout.bounds_mm
+            self.annotation_valid[ann_id] = (
+                min_x >= -1e-6
+                and min_y >= -1e-6
+                and max_x <= A4_WIDTH_MM + 1e-6
+                and max_y <= A4_HEIGHT_MM + 1e-6
+            )
+        if origin is not None and emit:
+            self.annotationMoved.emit(ann_id, origin.x_mm, origin.y_mm)
+        self.viewport().unsetCursor()
+        if emit:
+            self.annotationDragFinished.emit(ann_id, False)
+        self.viewport().update()
+        return True
 
     def cancel_layout_drag(self, *, emit=True):
         if not self.is_layout_dragging:
@@ -685,18 +945,36 @@ class SheetView(ImageView):
         return True
 
     def keyPressEvent(self, event):
+        if self.is_text_dragging and event.key() == Qt.Key.Key_Escape:
+            self.cancel_text_drag()
+            event.accept()
+            return
+        if self.placing_text and event.key() == Qt.Key.Key_Escape:
+            self.set_placing_text(False)
+            self.placingTextCancelled.emit()
+            event.accept()
+            return
         if self.is_layout_dragging and event.key() == Qt.Key.Key_Escape:
             self.cancel_layout_drag()
+            event.accept()
+            return
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and self.selected_annotation_id is not None
+            and not self.is_text_dragging
+        ):
+            self.annotationDeleteRequested.emit(self.selected_annotation_id)
             event.accept()
             return
         super().keyPressEvent(event)
 
     def focusOutEvent(self, event):
         self.cancel_layout_drag()
+        self.cancel_text_drag()
         super().focusOutEvent(event)
 
     def wheelEvent(self, event):
-        if self.is_layout_dragging:
+        if self.is_layout_dragging or self.is_text_dragging:
             event.accept()
         else:
             super().wheelEvent(event)
@@ -735,6 +1013,22 @@ class SheetView(ImageView):
                 painter.drawLine(QPointF(105, 0), QPointF(105, 297))
             if self.sheet_layout.offset_y_mm == 0:
                 painter.drawLine(QPointF(0, 148.5), QPointF(210, 148.5))
+        for ann in self.annotations:
+            layout = self.annotation_layouts.get(ann.id)
+            if layout is None:
+                continue
+            valid = self.annotation_valid.get(ann.id, True)
+            selected = ann.id == self.selected_annotation_id
+            if not valid:
+                pen = QPen(QColor("#dc2626"), 1.6, Qt.PenStyle.DashLine)
+            elif selected:
+                pen = QPen(self._accent_color, 1.5, Qt.PenStyle.DashLine)
+            else:
+                continue
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolygon(QPolygonF([QPointF(*pt) for pt in layout.quad_mm]))
 
     def paintEvent(self, event):
         super().paintEvent(event)

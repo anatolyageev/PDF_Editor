@@ -178,6 +178,21 @@ ICONS: dict[str, str] = {
         '<polyline points="3 9 3 3 9 3"/>'
         "</svg>"
     ),
+    "text": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        'stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">'
+        '<polyline points="4 7 4 4 20 4 20 7"/>'
+        '<line x1="9" y1="20" x2="15" y2="20"/>'
+        '<line x1="12" y1="4" x2="12" y2="20"/>'
+        "</svg>"
+    ),
+    "watermark": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        'stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">'
+        '<rect x="3" y="4" width="18" height="16" rx="2"/>'
+        '<line x1="6" y1="16" x2="18" y2="8" stroke-dasharray="2.5 2"/>'
+        "</svg>"
+    ),
 }
 
 
