@@ -32,7 +32,8 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
    - Update [PROJECT_STATUS.md](PROJECT_STATUS.md) with the date, outcome, and checks actually run.
    - Update [ARCHITECTURE.md](ARCHITECTURE.md) if modules, coordinate systems, or data flow changed.
    - Update [README.md](../README.md) if the user workflow, shortcuts, or supported features changed.
-7. **Stop cleanly:** Summarize what was implemented, which tests/checks passed, and which task is next in the queue.
+7. **Branching & push workflow:** Commit and push all completed task changes to the integration branch `optimization_fiture` (keeping `main` untouched). Do not merge or push to `main` until the user has tested `optimization_fiture` and explicitly asks to merge into `main`.
+8. **Stop cleanly:** Summarize what was implemented, which tests/checks passed, and which task is next in the queue.
 
 ---
 
@@ -41,7 +42,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 | ID | Milestone | Title | Status | Depends On |
 | --- | --- | --- | --- | --- |
 | `T-18` | M0 · Reliability | Block export during draft selection and reject stale inspector results | `DONE` | — |
-| `T-19` | M0 · Reliability | Isolate PyMuPDF in a process and bound PDF scheduling/caches | `TODO` | `T-18` |
+| `T-19` | M0 · Reliability | Isolate PyMuPDF in a process and bound PDF scheduling/caches | `DONE` | `T-18` |
 | `T-21` | M0 · Reliability | Extract shared safe-save and original/source identity guards | `TODO` | `T-19` |
 | `T-01` | M1 · Foundation & UX | Extract domain models from `ui/window.py` into `src/cardprint/model.py` | `TODO` | — |
 | `T-05` | M1 · Foundation & UX | Add parametric Undo/Redo for card, assignment and layout edits | `TODO` | `T-01`, `T-18` |
@@ -82,9 +83,9 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-19`: Isolate PyMuPDF in a process and bound PDF scheduling/caches
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-18`
-- **Target files:** new `src/cardprint/pdf_worker.py`, `src/cardprint/imaging.py`, `src/cardprint/ui/tasks.py`, `src/cardprint/ui/window.py`, `src/cardprint/app.py`, relevant imaging/UI tests and worker tests
+- **Target files:** new `src/cardprint/pdf_worker.py`, `src/cardprint/imaging.py`, `src/cardprint/ui/tasks.py`, `src/cardprint/ui/window.py`, `src/cardprint/app.py`, `src/cardprint/export.py`, `scripts/gui_smoke.py`, relevant imaging/UI tests and worker tests
 - **Goal:** Follow the supported PyMuPDF process model for existing imports and future PDF editing, without blocking Qt.
 - **Acceptance criteria:**
   - Route all application PyMuPDF calls, including thumbnails, source rendering and font/PDF inspection, through one spawned child process initially. Never use concurrent Qt threads or share live PyMuPDF objects across execution boundaries. Pure image operations may still use `QThreadPool`.
@@ -92,7 +93,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - Batch thumbnails and apply byte-bounded LRU caches (initial 32 MiB thumbnails / 128 MiB display pages), along with `MAX_PIXELS` allocation limits. Test eviction/queue behavior deterministically rather than asserting an exact OS RSS value.
   - Keep core image functions usable without creating a QApplication. Worker imports never start UI/processes recursively; module-level entry points work with `spawn`. Public API compatibility and intentional changes are documented.
   - Test actual child-process startup/shutdown, overlapping import/render requests, source replacement, stale results, crash recovery, and close during work using artificial PDFs. Record measured peak memory for a reproducible multi-page input. Report native Windows verification separately; Linux `spawn` alone does not establish it.
-- **Verification:** Target worker/imaging/UI tests, then the full quality gate and a GUI smoke scenario when available.
+- **Verification:** `uv run pytest -q` (45 passed, Linux `spawn`, Qt `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (18 files formatted), `QT_QPA_PLATFORM=offscreen uv run python scripts/gui_smoke.py` (passed), plus 24-page A4 synthetic PDF memory check (`parent_tracemalloc_peak = 101.67 MiB`, `child_ru_maxrss = 146.82 MiB`). Native Windows `spawn` verification remains separate/unverified.
 
 ### `T-21`: Extract shared safe-save and original/source identity guards
 

@@ -6,13 +6,16 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pymupdf
 from PIL import Image, ImageOps
 
 from .geometry import Quad, quad_size, validate_quad
-
-PDF_DPI = 300
-MAX_PIXELS = 80_000_000
+from .pdf_worker import (
+    DEFAULT_THUMBNAIL_BATCH_SIZE,
+    MAX_PIXELS,
+    PDF_DPI,
+    PdfWorkerClient,
+    get_default_pdf_worker,
+)
 
 
 @dataclass(frozen=True)
@@ -25,22 +28,6 @@ class Source:
     def label(self):
         prefix = f"Стр. {self.page + 1} · " if self.page is not None else ""
         return prefix + self.path.name
-
-
-def _open_pdf(path):
-    try:
-        doc = pymupdf.open(path)
-    except Exception as exc:
-        raise ValueError(
-            "Не удалось прочитать PDF: файл повреждён или имеет неверный формат."
-        ) from exc
-    if doc.needs_pass:
-        doc.close()
-        raise ValueError("PDF защищён паролем. Откройте локальную копию без парольной защиты.")
-    if doc.page_count == 0:
-        doc.close()
-        raise ValueError("PDF не содержит страниц.")
-    return doc
 
 
 def _photo(path) -> Image.Image:
@@ -64,20 +51,31 @@ def _photo(path) -> Image.Image:
         ) from exc
 
 
-def discover(path: str | Path) -> list[Source]:
+def discover_pdf_batches(
+    path: str | Path,
+    *,
+    batch_size: int = DEFAULT_THUMBNAIL_BATCH_SIZE,
+    worker: PdfWorkerClient | None = None,
+):
+    """Yield ``(batch_sources, total_pages)`` tuples via the isolated PDF worker."""
+    resolved = Path(path).resolve()
+    if resolved.suffix.lower() != ".pdf":
+        raise ValueError("Ожидался PDF-файл.")
+    client = worker or get_default_pdf_worker()
+    info = client.inspect_pdf(resolved)
+    for start in range(0, info.page_count, batch_size):
+        batch = client.render_thumbnail_batch(resolved, start, count=batch_size)
+        sources = [Source(resolved, page_idx, img.to_pil()) for page_idx, img in batch.items]
+        yield sources, info.page_count
+
+
+def discover(path: str | Path, *, worker: PdfWorkerClient | None = None) -> list[Source]:
     path = Path(path).resolve()
     if path.suffix.lower() == ".pdf":
-        with _open_pdf(path) as doc:
-            sources = []
-            for i, page in enumerate(doc):
-                scale = min(180 / page.rect.width, 140 / page.rect.height)
-                pix = page.get_pixmap(
-                    matrix=pymupdf.Matrix(scale, scale), colorspace=pymupdf.csRGB, alpha=False
-                )
-                sources.append(
-                    Source(path, i, Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
-                )
-            return sources
+        sources: list[Source] = []
+        for batch_sources, _total in discover_pdf_batches(path, worker=worker):
+            sources.extend(batch_sources)
+        return sources
     if path.suffix.lower() not in (".png", ".jpg", ".jpeg"):
         raise ValueError("Поддерживаются только PDF, JPG, JPEG и PNG.")
     thumb = _photo(path)
@@ -85,20 +83,19 @@ def discover(path: str | Path) -> list[Source]:
     return [Source(path, None, thumb)]
 
 
-def load_source(source: Source) -> np.ndarray:
+def load_source(source: Source, *, worker: PdfWorkerClient | None = None) -> np.ndarray:
     if source.page is None:
         image = _photo(source.path)
-    else:
-        with _open_pdf(source.path) as doc:
-            page = doc[source.page]
-            if page.rect.width * page.rect.height * (PDF_DPI / 72) ** 2 > MAX_PIXELS:
-                raise ValueError("Страница слишком велика для рендеринга в 300 DPI (более 80 Мп).")
-            pix = page.get_pixmap(dpi=PDF_DPI, colorspace=pymupdf.csRGB, alpha=False)
-            image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-    if min(image.size) < 4:
+        if min(image.size) < 4:
+            raise ValueError("Изображение слишком маленькое для выделения карточки.")
+        array = np.array(image, dtype=np.uint8)
+        array.flags.writeable = False
+        return array
+    client = worker or get_default_pdf_worker()
+    rendered = client.render_page(source.path, source.page, dpi=PDF_DPI)
+    array = rendered.to_array()
+    if min(array.shape[1], array.shape[0]) < 4:
         raise ValueError("Изображение слишком маленькое для выделения карточки.")
-    array = np.array(image, dtype=np.uint8)
-    array.flags.writeable = False
     return array
 
 

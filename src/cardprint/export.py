@@ -12,6 +12,7 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 from .geometry import A4_HEIGHT_MM, A4_WIDTH_MM, MM_TO_PT, Placement
+from .pdf_worker import PdfWorkerClient, get_default_pdf_worker
 
 PRINT_HINT = "Для сохранения размера печатайте в масштабе 100% / Фактический размер"
 
@@ -55,7 +56,14 @@ def _write_pdf(sheet: Sheet, path: Path):
     pdf.save()
 
 
-def export_sheet(sheet: Sheet, target: str | Path, kind: str, *, overwrite: bool = False):
+def export_sheet(
+    sheet: Sheet,
+    target: str | Path,
+    kind: str,
+    *,
+    overwrite: bool = False,
+    pdf_worker: PdfWorkerClient | None = None,
+):
     """Stage beside destination, then commit atomically; no silent replacement."""
     target = Path(target)
     if target.exists() and not overwrite:
@@ -66,6 +74,7 @@ def export_sheet(sheet: Sheet, target: str | Path, kind: str, *, overwrite: bool
     try:
         if kind == "pdf":
             _write_pdf(sheet, staging)
+            (pdf_worker or get_default_pdf_worker()).validate_pdf(staging, expected_pages=1)
         elif kind == "png":
             render_sheet(sheet, dpi=300).save(staging, format="PNG", dpi=(300, 300))
         else:

@@ -1,6 +1,9 @@
+import os
+import signal
 from dataclasses import dataclass
 
 import numpy as np
+import pymupdf
 import pytest
 from PIL import Image
 from PySide6.QtCore import QPointF, Qt
@@ -8,6 +11,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
 from cardprint.imaging import full_quad
+from cardprint.pdf_worker import PdfWorkerClient
 from cardprint.ui.editor import ImageView
 from cardprint.ui.window import InspectorDialog, MainWindow
 
@@ -512,3 +516,89 @@ def test_open_inspector_marks_itself_stale_on_edit_replace_and_remove(
     dialog3.close()
     controller.drain()
     window.close()
+
+
+def _make_multipage_pdf(path, pages: int = 10):
+    with pymupdf.open() as doc:
+        for i in range(pages):
+            page = doc.new_page(width=220, height=140)
+            page.draw_rect(
+                pymupdf.Rect(20, 20, 200, 120),
+                color=(0.1, 0.25, 0.5),
+                fill=(0.88, 0.92, 0.96),
+            )
+            page.insert_text((35, 65), f"CARD {i + 1}", fontsize=16, color=(0.1, 0.1, 0.1))
+        doc.save(path)
+
+
+def test_pdf_batched_import_and_overlapping_side_replacement(qtbot, tmp_path):
+    pdf = tmp_path / "ten_pages.pdf"
+    _make_multipage_pdf(pdf, pages=10)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.import_paths([pdf])
+    qtbot.waitUntil(lambda: window.sources.count() == 10 and not window.tasks, timeout=20000)
+
+    # Rapidly trigger overlapping PDF side loads; final requested page must win.
+    for row in (0, 3, 7):
+        window.sources.setCurrentRow(row)
+        window.assign_selected("front")
+    wait_ready(qtbot, window)
+    assert window.cards["front"].source.page == 7
+    assert len(window.sheet.placements) == 1
+    window.close()
+    qtbot.waitUntil(lambda: window._closed, timeout=10000)
+    assert not window.pdf_worker.is_alive
+
+
+def test_pdf_worker_crash_releases_busy_state_and_recovers_in_gui(qtbot, tmp_path, monkeypatch):
+    pdf = tmp_path / "two_pages.pdf"
+    _make_multipage_pdf(pdf, pages=2)
+    client = PdfWorkerClient()
+    window = MainWindow(pdf_worker=client)
+    qtbot.addWidget(window)
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: errors.append(args[-1]))
+    try:
+        window.show()
+        window.import_paths([pdf])
+        qtbot.waitUntil(lambda: window.sources.count() == 2 and not window.tasks, timeout=20000)
+        pid1 = client.worker_pid
+        assert pid1 is not None
+        os.kill(pid1, signal.SIGKILL)
+        os.waitpid(pid1, 0)
+
+        window.sources.setCurrentRow(0)
+        window.assign_selected("front")
+        qtbot.waitUntil(lambda: not window.tasks, timeout=20000)
+        assert errors and "аварийно" in errors[-1]
+        assert not window.progress.isVisible()
+        assert "front" not in window.cards
+
+        # Subsequent retry spawns a fresh PDF worker and succeeds.
+        window.assign_selected("front")
+        wait_ready(qtbot, window)
+        assert window.cards["front"].source.page == 0
+        assert client.worker_pid is not None and client.worker_pid != pid1
+        window.close()
+        qtbot.waitUntil(lambda: window._closed, timeout=10000)
+    finally:
+        client.shutdown()
+
+
+def test_window_close_cancels_queued_pdf_work_and_shuts_down_worker(qtbot, tmp_path):
+    pdf = tmp_path / "twenty_pages.pdf"
+    _make_multipage_pdf(pdf, pages=20)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.import_paths([pdf])
+    qtbot.waitUntil(lambda: window.sources.count() >= 1, timeout=10000)
+    for row in range(min(5, window.sources.count())):
+        window.sources.setCurrentRow(row)
+        window.assign_selected("front")
+    window.close()
+    qtbot.waitUntil(lambda: window._closed, timeout=15000)
+    assert not window.tasks
+    assert not window.pdf_worker.is_alive

@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ from .ui.window import MainWindow
 
 
 def main():
+    multiprocessing.freeze_support()
     # WSLg may expose Wayland without setting XDG_SESSION_TYPE. Prefer its working
     # compositor over X11 when present; an explicit user Qt backend always wins.
     if sys.platform == "linux" and "QT_QPA_PLATFORM" not in os.environ:

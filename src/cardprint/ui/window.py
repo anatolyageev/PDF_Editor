@@ -43,8 +43,18 @@ from ..imaging import (
     rotated,
     round_corners,
 )
+from ..pdf_worker import (
+    DEFAULT_THUMBNAIL_BATCH_SIZE,
+    PDF_DPI,
+    InspectPdfRequest,
+    PdfInfo,
+    PdfWorkerClient,
+    RenderPageRequest,
+    ThumbnailBatchRequest,
+    ThumbnailBatchResult,
+)
 from .editor import CORNER_LABELS, ImageView, pixmap, to_qimage
-from .tasks import Task
+from .tasks import PdfTaskBridge, Task, dispatch_pdf_request
 
 SIDE_NAMES = {"front": "Лицевая сторона", "back": "Обратная сторона"}
 
@@ -145,7 +155,7 @@ class Card:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, pdf_worker: PdfWorkerClient | None = None):
         super().__init__()
         self.setWindowTitle("Карточки на A4 · локальная подготовка к печати")
         self.resize(1380, 880)
@@ -153,6 +163,8 @@ class MainWindow(QMainWindow):
         self.active_side = "front"
         self.sheet = None
         self.layout_generation = 0
+        self.import_generation = 0
+        self.session_id = 1
         self.load_generation = {"front": 0, "back": 0}
         self.inspector_request_id = {"front": 0, "back": 0}
         self.inspectors: list[InspectorDialog] = []
@@ -161,6 +173,8 @@ class MainWindow(QMainWindow):
         self.tasks = {}
         self.pending_loads = set()
         self.original_paths = set()
+        self._owns_pdf_worker = pdf_worker is None
+        self.pdf_worker = pdf_worker or PdfWorkerClient()
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(2)
         self.syncing = False
@@ -376,6 +390,35 @@ class MainWindow(QMainWindow):
         self.progress.show()
         self.pool.start(task)
 
+    def submit_pdf(
+        self,
+        request,
+        success,
+        error=None,
+        *,
+        coalesce_key=None,
+        cancelled=None,
+        is_export: bool = False,
+    ):
+        if self._closing or self._closed:
+            return None
+        bridge = PdfTaskBridge(self)
+        key = id(bridge)
+        self.tasks[key] = bridge
+        bridge.success.connect(success)
+        bridge.error.connect(error or self.show_error)
+        if cancelled is not None:
+            bridge.cancelled.connect(cancelled)
+        bridge.finished.connect(lambda: self.task_finished(key))
+        self.progress.show()
+        return dispatch_pdf_request(
+            bridge,
+            self.pdf_worker,
+            request,
+            coalesce_key=coalesce_key,
+            is_export=is_export,
+        )
+
     def task_finished(self, key):
         self.tasks.pop(key, None)
         if not self.tasks:
@@ -393,46 +436,121 @@ class MainWindow(QMainWindow):
         if paths:
             self.import_paths(paths)
 
-    def import_paths(self, paths):
-        self.original_paths.update(Path(path).resolve() for path in paths)
-
-        def work():
-            sources, errors = [], []
-            for path in paths:
-                try:
-                    sources.extend(discover(path))
-                except Exception as exc:
-                    errors.append(f"{Path(path).name}: {exc}")
-            return sources, errors
-
-        def done(result):
-            sources, errors = result
-            self.original_paths.update(source.path for source in sources)
-            existing = {
-                (
-                    self.sources.item(i).data(Qt.ItemDataRole.UserRole).path,
-                    self.sources.item(i).data(Qt.ItemDataRole.UserRole).page,
-                )
-                for i in range(self.sources.count())
-            }
-            for source in sources:
-                if (source.path, source.page) in existing:
-                    continue
-                item = QListWidgetItem(QIcon(pixmap(source.thumbnail)), source.label)
-                item.setData(Qt.ItemDataRole.UserRole, source)
-                item.setSizeHint(QSize(190, 150))
-                item.setToolTip(str(source.path))
-                self.sources.addItem(item)
-                existing.add((source.path, source.page))
-            if self.sources.currentRow() < 0 and self.sources.count():
-                self.sources.setCurrentRow(0)
-            self.statusBar().showMessage(
-                f"Добавлено страниц и изображений: {len(sources)}. Выберите стороны документа."
+    def _append_sources(self, sources: list[Source]) -> int:
+        self.original_paths.update(source.path for source in sources)
+        existing = {
+            (
+                self.sources.item(i).data(Qt.ItemDataRole.UserRole).path,
+                self.sources.item(i).data(Qt.ItemDataRole.UserRole).page,
             )
-            if errors:
-                self.show_error("\n\n".join(errors))
+            for i in range(self.sources.count())
+        }
+        added = 0
+        for source in sources:
+            if (source.path, source.page) in existing:
+                continue
+            item = QListWidgetItem(QIcon(pixmap(source.thumbnail)), source.label)
+            item.setData(Qt.ItemDataRole.UserRole, source)
+            item.setSizeHint(QSize(190, 150))
+            item.setToolTip(str(source.path))
+            self.sources.addItem(item)
+            existing.add((source.path, source.page))
+            added += 1
+        if self.sources.currentRow() < 0 and self.sources.count():
+            self.sources.setCurrentRow(0)
+        return added
 
-        self.submit(work, done)
+    def import_paths(self, paths):
+        if self._closing or self._closed:
+            return
+        self.original_paths.update(Path(path).resolve() for path in paths)
+        pdf_paths = [Path(path).resolve() for path in paths if Path(path).suffix.lower() == ".pdf"]
+        other_paths = [path for path in paths if Path(path).suffix.lower() != ".pdf"]
+
+        if other_paths:
+
+            def work():
+                sources, errors = [], []
+                for path in other_paths:
+                    try:
+                        sources.extend(discover(path))
+                    except Exception as exc:
+                        errors.append(f"{Path(path).name}: {exc}")
+                return sources, errors
+
+            def done(result):
+                if self._closing or self._closed:
+                    return
+                sources, errors = result
+                self._append_sources(sources)
+                self.statusBar().showMessage(
+                    f"Добавлено страниц и изображений: {len(sources)}. Выберите стороны документа."
+                )
+                if errors:
+                    self.show_error("\n\n".join(errors))
+
+            self.submit(work, done)
+
+        if pdf_paths:
+            self.import_generation += 1
+            import_gen = self.import_generation
+            for pdf_path in pdf_paths:
+                self._import_pdf_batched(pdf_path, import_gen)
+
+    def _import_pdf_batched(self, pdf_path: Path, import_gen: int) -> None:
+        def request_batch(start_page: int) -> None:
+            if self._closing or self._closed:
+                return
+
+            def on_batch(batch: ThumbnailBatchResult) -> None:
+                if self._closing or self._closed:
+                    return
+                sources = [
+                    Source(Path(batch.path), page_idx, img.to_pil())
+                    for page_idx, img in batch.items
+                ]
+                self._append_sources(sources)
+                next_start = batch.items[-1][0] + 1 if batch.items else batch.total_pages
+                if next_start < batch.total_pages:
+                    self.statusBar().showMessage(
+                        f"Загрузка миниатюр {pdf_path.name}: {next_start} из {batch.total_pages}…"
+                    )
+                    request_batch(next_start)
+                else:
+                    self.statusBar().showMessage(
+                        f"Добавлено страниц PDF ({batch.total_pages}): {pdf_path.name}. Выберите стороны документа."
+                    )
+
+            def on_batch_error(message: str) -> None:
+                if not (self._closing or self._closed):
+                    self.show_error(f"{pdf_path.name}: {message}")
+
+            self.submit_pdf(
+                ThumbnailBatchRequest(
+                    str(pdf_path),
+                    start_page=start_page,
+                    count=DEFAULT_THUMBNAIL_BATCH_SIZE,
+                    session_id=import_gen,
+                ),
+                on_batch,
+                on_batch_error,
+            )
+
+        def on_inspected(info: PdfInfo) -> None:
+            if self._closing or self._closed:
+                return
+            self.original_paths.add(Path(info.path))
+            request_batch(0)
+
+        def on_inspect_error(message: str) -> None:
+            if not (self._closing or self._closed):
+                self.show_error(f"{pdf_path.name}: {message}")
+
+        self.submit_pdf(
+            InspectPdfRequest(str(pdf_path), session_id=import_gen),
+            on_inspected,
+            on_inspect_error,
+        )
 
     def assign_next(self, _item=None):
         self.assign_selected(
@@ -454,18 +572,7 @@ class MainWindow(QMainWindow):
         self.refresh_inspectors()
         self.invalidate_sheet("Загрузка выбранной стороны…")
 
-        def work():
-            original = load_source(source)
-            found = detect_quad(original)
-            h, w = original.shape[:2]
-            return (
-                original,
-                found or full_quad(w, h),
-                thumbnail(Image.fromarray(original)),
-                found is not None,
-            )
-
-        def done(result):
+        def finish_load(result):
             if self._closing or self._closed or token != self.load_generation[side]:
                 return
             self.pending_loads.discard(side)
@@ -484,13 +591,57 @@ class MainWindow(QMainWindow):
                 else "Контур не найден. Укажите четыре угла вручную или перетащите точки."
             )
 
-        def failed(message):
+        def fail_load(message):
             if not (self._closing or self._closed) and token == self.load_generation[side]:
                 self.pending_loads.discard(side)
                 self.show_error(message)
                 self.layout_changed()
 
-        self.submit(work, done, failed)
+        if source.page is None:
+
+            def work():
+                original = load_source(source)
+                found = detect_quad(original)
+                h, w = original.shape[:2]
+                return (
+                    original,
+                    found or full_quad(w, h),
+                    thumbnail(Image.fromarray(original)),
+                    found is not None,
+                )
+
+            self.submit(work, finish_load, fail_load)
+        else:
+
+            def on_pdf_rendered(rendered):
+                if self._closing or self._closed or token != self.load_generation[side]:
+                    return
+                original = rendered.to_array()
+
+                def image_work():
+                    found = detect_quad(original)
+                    h, w = original.shape[:2]
+                    return (
+                        original,
+                        found or full_quad(w, h),
+                        thumbnail(Image.fromarray(original)),
+                        found is not None,
+                    )
+
+                self.submit(image_work, finish_load, fail_load)
+
+            self.submit_pdf(
+                RenderPageRequest(
+                    str(source.path),
+                    source.page,
+                    dpi=PDF_DPI,
+                    session_id=self.session_id,
+                    revision=token,
+                ),
+                on_pdf_rendered,
+                fail_load,
+                coalesce_key=("load_side", side),
+            )
 
     def remove_source(self):
         row = self.sources.currentRow()
@@ -505,6 +656,7 @@ class MainWindow(QMainWindow):
             self._clear_draft()
         self.load_generation[self.active_side] += 1
         self.pending_loads.discard(self.active_side)
+        self.pdf_worker.cancel_key(("load_side", self.active_side))
         self.cards.pop(self.active_side, None)
         self.refresh_inspectors()
         self.show_card()
@@ -1022,7 +1174,12 @@ class MainWindow(QMainWindow):
             self.export_message.setText(f"Сохранено: {target.name}\n\n{PRINT_HINT}")
             self.statusBar().showMessage(f"Сохранено: {target}")
 
-        self.submit(lambda: export_sheet(sheet, target, kind, overwrite=overwrite), done)
+        self.submit(
+            lambda: export_sheet(
+                sheet, target, kind, overwrite=overwrite, pdf_worker=self.pdf_worker
+            ),
+            done,
+        )
 
     def open_export(self):
         if self.export_path and not QDesktopServices.openUrl(
@@ -1036,6 +1193,7 @@ class MainWindow(QMainWindow):
             return
         self.layout_timer.stop()
         self._clear_draft()
+        self.pdf_worker.cancel_pending(keep_exports=True)
         if self.tasks:
             self._closing = True
             self.statusBar().showMessage("Завершение фоновых операций перед закрытием…")
@@ -1046,4 +1204,6 @@ class MainWindow(QMainWindow):
             for dialog in list(self.inspectors):
                 dialog.close()
             self.inspectors.clear()
+            if self._owns_pdf_worker:
+                self.pdf_worker.shutdown()
             event.accept()

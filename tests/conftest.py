@@ -7,6 +7,14 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
+from cardprint.pdf_worker import shutdown_default_pdf_worker
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_default_pdf_worker():
+    yield
+    shutdown_default_pdf_worker()
+
 
 @pytest.fixture
 def synthetic_card():

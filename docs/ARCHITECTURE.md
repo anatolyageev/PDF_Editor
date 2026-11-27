@@ -18,13 +18,14 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 
 | File | Responsibility |
 | --- | --- |
-| [app.py](../src/cardprint/app.py) | QApplication, Russian locale, Fusion style, Wayland selection when its socket is available, and MainWindow startup. |
-| [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, PDF thumbnails, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt dependency. |
+| [app.py](../src/cardprint/app.py) | QApplication, `multiprocessing.freeze_support()`, Russian locale, Fusion style, Wayland selection when its socket is available, and MainWindow startup. |
+| [pdf_worker.py](../src/cardprint/pdf_worker.py) | Single spawned PyMuPDF child process, serializable IPC requests/results, request coalescing, crash recovery, and byte-bounded `ByteLRUCache` (32 MiB thumbnails / 128 MiB display pages). No Qt dependency. |
+| [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, batched PDF discovery via `pdf_worker`, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt or top-level PyMuPDF dependency. |
 | [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, and arrange. Independent of the UI. |
-| [export.py](../src/cardprint/export.py) | Sheet, render_sheet, PDF/PNG output, and safe file writing. No Qt dependency. |
+| [export.py](../src/cardprint/export.py) | Sheet, render_sheet, PDF/PNG output, staged PDF validation via `pdf_worker`, and safe file writing. No Qt dependency. |
 | [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, zoom, and pan. |
 | [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, Card state, side assignments, settings, task coordination, and export actions. |
-| [ui/tasks.py](../src/cardprint/ui/tasks.py) | QRunnable with success/error/finished signals. |
+| [ui/tasks.py](../src/cardprint/ui/tasks.py) | `QRunnable` `Task` for pure image work and `PdfTaskBridge` for delivering `PdfWorkerClient` results onto the GUI thread. |
 | [tests/](../tests/) | Geometry, processing, export, and Qt integration tests using artificial data. |
 | [scripts/](../scripts/) | Example generation and a GUI smoke test that saves screenshots and exports. |
 
@@ -34,11 +35,13 @@ persistence layer or a general-purpose PDF editing engine exists.
 
 ## Data flow
 
-1. `discover(path)` returns `Source(path, page, thumbnail)` objects. `page` is a
-   zero-based PDF page index or `None` for a photo. PDFs are initially read for thumbnails.
-2. Assigning `front` or `back` calls `load_source(source)`. Photo loading applies
-   EXIF orientation; PDF pages are rendered to RGB at 300 DPI. The result is a NumPy
-   `uint8` array with `writeable=False`.
+1. `discover(path)` returns `Source(path, page, thumbnail)` objects; `discover_pdf_batches(path)`
+   yields 8-page PDF thumbnail batches via `PdfWorkerClient` (without creating a `QApplication`).
+   In the GUI, PDFs are inspected first and loaded in batches so thumbnails appear incrementally.
+2. Assigning `front` or `back` calls `load_source(source)` (or `RenderPageRequest` via `PdfWorkerClient`
+   followed by pure-image `detect_quad` on `QThreadPool`). Photo loading applies EXIF orientation;
+   PDF pages are rendered to RGB at 300 DPI inside the spawned PyMuPDF child process and returned
+   as `bytes`, yielding a NumPy `uint8` array with `writeable=False`.
 3. A `Card` holds immutable `original` pixels, a rotation count `turns`, four
    `points`, physical `size`, and corner `radius`. `detect_quad` proposes an initial
    contour; if detection fails, the entire image is selected.
@@ -50,7 +53,13 @@ persistence layer or a general-purpose PDF editing engine exists.
    and `rendered` images form a `Sheet`.
 6. `render_sheet` creates the screen preview at 120 DPI and PNG output at 300 DPI.
    `_write_pdf` uses the same images and placements, retaining the processed card's
-   pixel resolution without JPEG recompression.
+   pixel resolution without JPEG recompression; `export_sheet` validates staged PDFs
+   in `pdf_worker` (`ValidatePdfRequest`) before publishing.
+
+Public API compatibility: `discover(path, *, worker=None)`, `load_source(source, *, worker=None)`,
+and `export_sheet(..., *, pdf_worker=None)` preserve their existing positional signatures while
+allowing callers to inject an explicit `PdfWorkerClient` or fall back to the lazy process-wide
+worker (`get_default_pdf_worker()`).
 
 Never export a PDF from the reduced `display` image or the rasterized sheet preview.
 `Source` references a file; before side assignment, it is not a complete snapshot
@@ -86,12 +95,22 @@ centered group. Offsets move the entire group, not each side independently.
 
 ## Background tasks and result freshness
 
-`MainWindow.submit` sends a `Task` to a QThreadPool with at most two worker threads.
-Signals deliver results or errors to the UI. The `tasks` collection retains active
-tasks until `finished`. Closing the window waits for ongoing work to complete.
-QImage may be prepared in a worker thread; QPixmap and widgets belong to the GUI thread.
+`MainWindow.submit` sends pure-image `Task` items to a `QThreadPool` with at most two
+worker threads. All PyMuPDF calls (inspection, batched thumbnails, 300 DPI page rendering,
+and staged PDF validation) are routed via `submit_pdf` / `PdfTaskBridge` to one `spawn`
+child process owned by `PdfWorkerClient`, never across concurrent Qt threads. `tasks`
+retains active `Task` and `PdfTaskBridge` entries until `finished`. Closing the window
+cancels queued non-export PDF work, waits for active tasks to drain, and shuts down
+owned `PdfWorkerClient` processes. `QImage` may be prepared in a worker thread; `QPixmap`
+and widgets belong to the GUI thread.
 
-Several independent counters and state fields protect result freshness:
+Several independent counters, caches, and state fields protect result freshness and memory:
+
+- `ByteLRUCache` bounds PDF thumbnail storage (`32 MiB`) and rendered 300 DPI page cache
+  (`128 MiB`), evicting least-recently-used entries automatically.
+- `coalesce_key` (`("load_side", side)`) cancels obsolete queued PDF side renders when
+  a newer page is chosen or the side is removed; `PdfWorkerCrashError` releases busy
+  state cleanly with a Russian explanation and respawns on the next request.
 
 - `Card.revision` / `ready_revision`: accept a result only for the same card and
   current edit. Changing corners or rotation invalidates `cropped`; changes to

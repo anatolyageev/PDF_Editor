@@ -60,18 +60,44 @@ and added export support for filesystems without hard links.
 - Next ready tasks in [TASKS.md](TASKS.md): `T-19` (depends on `T-18`) and `T-01`
   (no dependencies).
 
+### `T-19` (2026-11-27) — Isolated PyMuPDF worker process & bounded caches
+
+- Added `src/cardprint/pdf_worker.py` (`PdfWorkerClient`, `_worker_main`,
+  `ByteLRUCache`, serializable request/response dataclasses) running all PyMuPDF
+  operations inside a single `spawn` child process without importing `pymupdf` in
+  the parent process or `PySide6` in the worker module.
+- Added byte-bounded LRU caches (`32 MiB` thumbnails, `128 MiB` display pages),
+  8-page thumbnail batching (`discover_pdf_batches` + UI `_import_pdf_batched`),
+  coalesced side-load rendering, clean worker cancellation/shutdown on window
+  close, and crash detection/recovery (`PdfWorkerCrashError`).
+- Added staged PDF export validation (`ValidatePdfRequest`) before publishing in
+  `src/cardprint/export.py`, `PdfTaskBridge` / `dispatch_pdf_request` in
+  `src/cardprint/ui/tasks.py`, and `multiprocessing.freeze_support()` in
+  `src/cardprint/app.py` and `scripts/gui_smoke.py` (`spawn`-safe entry points).
+- Kept `discover()` and `load_source()` usable without `QApplication`.
+- Added deterministic worker and GUI tests in `tests/test_pdf_worker.py` and
+  `tests/test_ui.py`.
+- Reproducible 24-page A4 synthetic PDF peak memory measurement (3 batches of 8
+  thumbnails + 2 pages rendered at 300 DPI, `3509 × 2480 × 3`): parent
+  `tracemalloc` peak `101.67 MiB`, child `ru_maxrss` `146.82 MiB`, thumbnail
+  cache `974.5 KiB`, display cache `49.80 MiB`.
+- Next ready tasks in [TASKS.md](TASKS.md): `T-21` (depends on `T-19`) and
+  `T-01` (no dependencies).
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-18` on 2026-11-27**
-(Qt `offscreen`, Linux):
+The following results were obtained **after completing `T-19` on 2026-11-27**
+(Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows
+and macOS remain unverified):
 
 | Check | Result and scope |
 | --- | --- |
-| `uv run pytest -q` | **36 passed** (`4.07s`), including 7 Qt `offscreen` UI tests (4 new deterministic `T-18` tests). |
+| `uv run pytest -q` | **45 passed** (`13.29s`), including `tests/test_pdf_worker.py` and 10 Qt `offscreen` UI tests. |
 | `uv run ruff check src tests scripts` | All checks passed. |
-| `uv run ruff format --check src tests scripts` | 16 files already formatted. |
+| `uv run ruff format --check src tests scripts` | 18 files already formatted. |
+| `QT_QPA_PLATFORM=offscreen uv run python scripts/gui_smoke.py` | Passed: exported `sheet.pdf` and `sheet.png` via spawned PDF worker. |
 
-Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-18`):
+Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-19`):
 
 | Check | Result and scope |
 | --- | --- |
