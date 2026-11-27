@@ -122,3 +122,11 @@ and developer navigation in the README. Subsequently translated the agent/develo
 documents into English at the user's request and recorded the language convention
 in `AGENTS.md`. The user guide remains in Russian. Application code was unchanged;
 implementation tests were not rerun for these documentation-only changes.
+
+2026-11-26: added [DESIGN.md](DESIGN.md) (planned `v0.2+` design specification
+covering UI/UX upgrades, dual-mode workspace, A4 text/watermarks, and full PDF
+Editor mode) and [TASKS.md](TASKS.md) (17 atomic tasks `T-01`–`T-17` with an
+execution protocol for one-task-per-run delivery), and cross-linked them from
+[AGENTS.md](../AGENTS.md). All planned features remain `TODO`; application code
+was unchanged and implementation tests were not rerun for these documentation-only
+changes.

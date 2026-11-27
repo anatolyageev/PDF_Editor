@@ -13,6 +13,9 @@ application for arranging document copies on A4, distributed as the Python packa
    coordinate systems, data flow, background tasks, and extension points.
 4. Inspect the current affected modules and local changes. Documentation records
    the state on its stated date; it is not evidence of a fresh test run.
+5. For planned design/feature work (including writing in PDFs and UI upgrades),
+   read [docs/DESIGN.md](docs/DESIGN.md) and execute one task at a time from
+   [docs/TASKS.md](docs/TASKS.md) following its Agent Execution Protocol.
 
 ## Required application properties
 
