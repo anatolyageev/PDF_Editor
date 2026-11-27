@@ -1,6 +1,6 @@
 # Project Status and Handoff
 
-Updated: **2026-11-26**. Version in `pyproject.toml`: **0.1.0**.
+Updated: **2026-11-27**. Version in `pyproject.toml`: **0.1.0**.
 This is persistent context for a new chat; understanding the project does not require
 access to the original conversation.
 
@@ -57,8 +57,16 @@ The following results were obtained **during the implementation iteration on
 | `timeout 3s uv run --offline cardprint` | Application started without error output; terminated by timeout (exit code 124), not a normal application exit. |
 
 Verification environment: Linux / WSLg, Python **3.14.2**, Wayland display backend.
-Dependencies and code target Python 3.12+, but separate runs on Python 3.12,
-Windows, and macOS have not been performed. Do not describe those as verified platforms.
+Dependencies and code target Python 3.12+. That original iteration did not include
+separate Python 3.12, Windows or macOS runs; subsequent review evidence is recorded
+below. Native Windows/macOS support must not be described as verified.
+
+Subsequent read-only review on 2026-11-26 also ran the unchanged baseline under
+Linux / Python **3.12.14** / Qt **offscreen**: 32 tests passed, Ruff and format
+checks passed, and the GUI smoke scenario exported PDF/PNG with screenshots
+inspected. This does not verify native Windows/macOS, a real display on that
+Python version, or physical printing. These remain historical implementation
+checks, not test runs for the 2026-11-27 documentation revision.
 
 An attempted Qt launch using X11 (`xcb`) failed in this environment because
 `libxcb-*` and `libxkbcommon-x11` system libraries were missing. Wayland worked,
@@ -114,6 +122,35 @@ automatically start implementing the limitations listed above.
    first, then connect the UI, preserving shared geometry and task freshness checks.
 5. Run appropriate targeted tests, then the full suite when changing code.
 6. Update this document with the outcome, checks actually performed, and remaining work.
+
+## Design Review — 2026-11-27
+
+Reviewed the newly added roadmap against baseline `38c8969`, the current source,
+official PyMuPDF documentation, and the installed/locked PyMuPDF `1.28.2` API.
+Only documentation changed; no roadmap feature or baseline fix was implemented.
+
+- Added reliability tasks for draft-selection export/inspector freshness (`T-18`),
+  a supported PDF worker process with bounded queues/caches (`T-19`), and shared
+  safe-save/original/source guards (`T-21`). The current two-thread pool still
+  permits PyMuPDF work in threads; the process boundary is **planned**, and no
+  concurrency crash is claimed to have been reproduced.
+- Added dirty-workspace/loss guards (`T-20`), memory-aware Undo requirements,
+  contextual controls and keyboard/high-DPI criteria. Separated contour detection
+  (`T-22`) from direct printing. Existing task IDs remain stable; all 22 are `TODO`.
+- Corrected unrotated PDF coordinate contracts, text anchors/fit/font resources,
+  rotated-page fixtures, visual masking/signature limitations, forms/page-copy
+  preservation and encryption policies. Removed unsupported fixed document sizes
+  and claims that printer configuration guarantees physical output scale.
+- Clarified staged-save fallback limits, source changes, project-file personal
+  data/schema validation, and that a design review must not start implementation.
+
+Review verification: inspected current source/lockfile, queried installed API
+signatures/version, and checked Markdown links plus task IDs, statuses and
+dependency consistency. Application tests and GUI smoke were **not rerun** for
+this documentation-only change. Native Windows and physical printing remain
+unverified. See [DESIGN.md](DESIGN.md) §10 for official references and
+[TASKS.md](TASKS.md) for the revised order; `T-18` is the first ready
+implementation task when implementation is requested.
 
 ## Latest documentation changes
 

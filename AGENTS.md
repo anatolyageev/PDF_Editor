@@ -14,8 +14,10 @@ application for arranging document copies on A4, distributed as the Python packa
 4. Inspect the current affected modules and local changes. Documentation records
    the state on its stated date; it is not evidence of a fresh test run.
 5. For planned design/feature work (including writing in PDFs and UI upgrades),
-   read [docs/DESIGN.md](docs/DESIGN.md) and execute one task at a time from
-   [docs/TASKS.md](docs/TASKS.md) following its Agent Execution Protocol.
+   read [docs/DESIGN.md](docs/DESIGN.md) and [docs/TASKS.md](docs/TASKS.md).
+   For implementation requests, execute one task at a time following the backlog's
+   Agent Execution Protocol. Review/documentation requests do not automatically
+   authorize implementing the next task.
 
 ## Required application properties
 
