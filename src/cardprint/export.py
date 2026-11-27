@@ -10,11 +10,11 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
-from .geometry import A4_HEIGHT_MM, A4_WIDTH_MM, MM_TO_PT, Placement
+from .geometry import A4_HEIGHT_MM, A4_WIDTH_MM, MM_TO_PT, Placement, crop_marks
 from .pdf_worker import PdfWorkerClient, get_default_pdf_worker
 
 PRINT_HINT = "Для сохранения размера печатайте в масштабе 100% / Фактический размер"
@@ -265,6 +265,7 @@ def atomic_write_file(
 class Sheet:
     images: dict[str, Image.Image]
     placements: list[Placement]
+    crop_marks: bool = False
 
 
 @dataclass(frozen=True)
@@ -273,6 +274,7 @@ class ExportSnapshot:
     placements: tuple[Placement, ...]
     revisions: tuple[tuple[str, int], ...] = ()
     source_fingerprints: tuple[SourceFingerprint, ...] = ()
+    crop_marks: bool = False
 
 
 def snapshot_sheet(
@@ -287,12 +289,21 @@ def snapshot_sheet(
         placements=tuple(sheet.placements),
         revisions=tuple(revisions),
         source_fingerprints=tuple(source_fingerprints),
+        crop_marks=sheet.crop_marks,
     )
 
 
 def render_sheet(sheet: Sheet, dpi: float = 120) -> Image.Image:
     scale = dpi / 25.4
     result = Image.new("RGB", (round(A4_WIDTH_MM * scale), round(A4_HEIGHT_MM * scale)), "white")
+    if sheet.crop_marks:
+        draw = ImageDraw.Draw(result)
+        for mark in crop_marks(sheet.placements).segments:
+            draw.line(
+                [tuple(round(v * scale) for v in point) for point in (mark.start, mark.end)],
+                fill=(0, 0, 0),
+                width=max(1, round(mark.width_mm * scale)),
+            )
     for item in sheet.placements:
         x, y = round(item.x_mm * scale), round(item.y_mm * scale)
         right, bottom = (
@@ -311,6 +322,17 @@ def _write_pdf(sheet: Sheet, path: Path):
     pdf.setTitle("Копии документов — A4")
     pdf.setFillColorRGB(1, 1, 1)
     pdf.rect(0, 0, A4_WIDTH_MM * MM_TO_PT, A4_HEIGHT_MM * MM_TO_PT, fill=1, stroke=0)
+    if sheet.crop_marks:
+        pdf.setStrokeColorRGB(0, 0, 0)
+        pdf.setLineCap(0)
+        for mark in crop_marks(sheet.placements).segments:
+            pdf.setLineWidth(mark.width_mm * MM_TO_PT)
+            pdf.line(
+                mark.start[0] * MM_TO_PT,
+                (A4_HEIGHT_MM - mark.start[1]) * MM_TO_PT,
+                mark.end[0] * MM_TO_PT,
+                (A4_HEIGHT_MM - mark.end[1]) * MM_TO_PT,
+            )
     for item in sheet.placements:
         pdf.drawImage(
             ImageReader(sheet.images[item.side]),

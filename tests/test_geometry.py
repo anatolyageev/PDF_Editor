@@ -58,3 +58,59 @@ def test_size_modes():
     assert CardSize("aspect", 90).resolve((900, 600)) == (90, 60)
     assert CardSize("custom", 93, 42).resolve((900, 600)) == (93, 42)
     assert CardSize().resolve((900, 600)) == (85.6, 53.98)
+
+
+@pytest.mark.parametrize(
+    "sizes,layout,omitted",
+    [
+        ({"front": (85.6, 53.98), "back": (85.6, 53.98)}, Layout(), False),
+        ({"front": (85.6, 53.98), "back": (85.6, 53.98)}, Layout(gap_mm=0), True),
+        ({"front": (70, 60), "back": (80, 40)}, Layout("horizontal", 1, 10), True),
+        ({"front": (110, 60), "back": (75, 50)}, Layout(gap_mm=1), True),
+        ({"front": (204, 100)}, Layout(margin_mm=3), True),
+        ({"front": (210, 297)}, Layout(margin_mm=0), True),
+    ],
+)
+def test_crop_marks_never_cross_cards_or_page_edges(sizes, layout, omitted):
+    from cardprint.geometry import crop_marks
+
+    placements = arrange(sizes, layout)
+    before = tuple(placements)
+    result = crop_marks(placements)
+    assert bool(result.omitted) is omitted
+    assert bool(result.warning) is omitted
+    assert tuple(placements) == before
+    for mark in result.segments:
+        assert mark.width_mm == 0.15
+        assert math.dist(mark.start, mark.end) == pytest.approx(3)
+        half = mark.width_mm / 2
+        x0, x1 = sorted((mark.start[0], mark.end[0]))
+        y0, y1 = sorted((mark.start[1], mark.end[1]))
+        assert x0 - half >= 0 and x1 + half <= 210
+        assert y0 - half >= 0 and y1 + half <= 297
+        for p in placements:
+            assert (
+                x1 + half < p.x_mm
+                or x0 - half > p.x_mm + p.width_mm
+                or y1 + half < p.y_mm
+                or y0 - half > p.y_mm + p.height_mm
+            )
+
+
+@pytest.mark.parametrize("template", ["vertical", "horizontal"])
+def test_group_position_clamps_to_arrange_and_snaps_in_control_precision(template):
+    from cardprint.geometry import position_group
+
+    sizes = {"front": (70.123, 51.234), "back": (65.678, 40.567)}
+    initial = Layout(template, crop_marks=True)
+    for x, y in ((10000, -10000), (-10000, 10000), (12.3456, 8.1234)):
+        moved = position_group(sizes, initial, x, y)
+        assert moved.crop_marks
+        assert moved.offset_x_mm == round(moved.offset_x_mm, 2)
+        assert moved.offset_y_mm == round(moved.offset_y_mm, 2)
+        assert len(arrange(sizes, moved)) == 2
+    snapped = position_group(sizes, initial, 0.79, -0.79)
+    assert snapped.offset_x_mm == snapped.offset_y_mm == 0
+    assert position_group(sizes, initial, 0.81, -0.81).offset_x_mm == 0.81
+    with pytest.raises(ValueError):
+        position_group(sizes, initial, math.nan, 0)

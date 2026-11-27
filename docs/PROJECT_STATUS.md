@@ -257,10 +257,56 @@ reported against commit `051d9b5` before proceeding to `T-02`:
 - Reconciled the master table's stale `T-02` / `T-03` statuses with their existing
   completed task sections. Next ready task: `T-06` (A4 preview upgrades); not started.
 
+### `T-06` (2026-11-27) — A4 rulers, guides, crop marks and group positioning
+
+- Added `Layout.crop_marks` (default off), shared 3 mm / 1 mm gap / 0.15 mm
+  `CropMark` geometry, and whole-segment omission if a stroke would leave A4 or
+  overlap either card. Omission produces a non-blocking Russian explanation.
+  Preview/PNG and vector PDF use the same segments; export snapshots retain the flag.
+- Added `SheetView` with an A4 millimetre scene, reduced card pixmaps, toggleable
+  adaptive mm rulers and dashed margin guides, pure-white paper in both themes,
+  and persistent zoom/pan across layout refreshes. Guides never export or dirty
+  the workspace. Fit-to-view leaves space for the ruler strips.
+- Added group dragging from either card, live offset controls, 0.8 mm centre-axis
+  snapping with snap lines, and `position_group` clamping to the shared margin
+  contract at 0.01 mm control precision. Mouse release commits one Undo step;
+  Escape/focus loss or independent layout/source invalidation cancels. Motion
+  only moves derived pixmaps and regenerates small mark sets, without card renders.
+- Extended draft/export and generation guards to layout gestures: stale previews
+  cannot replace a drag; current snapshots retain the committed layout until
+  release; PDF dialogs cannot change the captured crop-mark option.
+- Added 13 geometry/export/UI cases covering small gaps, asymmetric cards,
+  zero/small margins, page edges, safe stroke bounds, exact PDF vector coordinates
+  and widths, PNG/preview marks on/off, card pixel preservation, Undo/Redo,
+  cancellation, clamping/snapping, stale results and captured exports.
+- Updated the Russian guide and architecture. Next ready task: `T-07` (Cyrillic
+  font resolution and shared text export); not started.
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-04` on 2026-11-27**
+The following results were obtained **after completing `T-06` on 2026-11-27**
 (Linux, Python **3.14.2**, Qt `offscreen`):
+
+| Check | Result and scope |
+| --- | --- |
+| `uv run pytest -q tests/test_geometry.py tests/test_export.py tests/test_ui.py` | **75 passed** (`19.97s`). |
+| `uv run pytest -q` | **99 passed**, **1 warning** (`23.44s`); see below. |
+| `uv run ruff check src tests scripts` | All checks passed. |
+| `uv run ruff format --check src tests scripts` | 22 files already formatted. |
+| `QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.25 uv run pytest -q tests/test_ui.py -k 'a4_drag or a4_guides'` | **3 passed** (`1.34s`). |
+| Same focused scaling command with `QT_SCALE_FACTOR=1.5` | **3 passed** (`1.15s`). |
+| Artificial two-card A4 preview at 1280 × 720 | Light/Dark screenshots visually inspected, including rulers, guides and crop marks. |
+
+The full run again reported the previously observed `PytestUnraisableExceptionWarning`
+from `BytesIO` finalization (`BufferError: Existing exports of data: object cannot be
+re-sized`), this time during
+`test_full_gui_import_assign_edit_preview_export_and_original_guard`. The focused
+75-test run had no warning. Its cause remains unconfirmed; no suppression was added.
+Native display/Windows/macOS scaling and physical printing remain unverified.
+`gui_smoke.py` was not rerun for `T-06`; the visual check used artificial photo import
+and both side assignments, not the full PDF smoke scenario.
+
+Previous `T-04` verification (2026-11-27):
 
 | Check | Result and scope |
 | --- | --- |

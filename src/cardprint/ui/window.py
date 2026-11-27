@@ -26,6 +26,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -61,7 +62,7 @@ from ..export import (
     render_sheet,
     snapshot_sheet,
 )
-from ..geometry import CardSize, Layout, arrange, validate_quad
+from ..geometry import CardSize, Layout, arrange, crop_marks, validate_quad
 from ..imaging import (
     Source,
     detect_quad,
@@ -84,7 +85,7 @@ from ..pdf_worker import (
     ThumbnailBatchRequest,
     ThumbnailBatchResult,
 )
-from .editor import CORNER_LABELS, ImageView, pixmap, to_qimage
+from .editor import CORNER_LABELS, ImageView, SheetView, pixmap, to_qimage
 from .icons import render_svg_icon
 from .tasks import PdfTaskBridge, Task, dispatch_pdf_request
 from .theme import (
@@ -502,7 +503,7 @@ class MainWindow(QMainWindow):
         self._sync_history_controls()
         self._sync_dirty_ui()
         self.invalidate_sheet("Назначьте стороны документа.")
-        self.preview.set_image(Image.new("RGB", (420, 594), "white"))
+        self.preview.clear_sheet()
 
     def _build_ui(self):
         root = QWidget()
@@ -715,11 +716,29 @@ class MainWindow(QMainWindow):
 
         preview_tab = QWidget()
         preview_layout = QVBoxLayout(preview_tab)
-        self.preview = ImageView()
+        self.preview = SheetView()
         self.preview.setAccessibleName("Предпросмотр листа A4")
+        self.preview.layoutDragStarted.connect(self.on_layout_drag_started)
+        self.preview.layoutMoved.connect(self.on_layout_moved)
+        self.preview.layoutDragFinished.connect(self.on_layout_drag_finished)
+        guides = QHBoxLayout()
+        self.rulers_toggle = QCheckBox("Линейки · мм")
+        self.guides_toggle = QCheckBox("Поля")
+        for toggle in (self.rulers_toggle, self.guides_toggle):
+            toggle.setChecked(True)
+            toggle.setToolTip("Направляющие видны только на экране и не печатаются")
+            guides.addWidget(toggle)
+        self.rulers_toggle.toggled.connect(self.preview.set_rulers_visible)
+        self.guides_toggle.toggled.connect(self.preview.set_guides_visible)
+        guides.addStretch()
+        preview_layout.addLayout(guides)
         preview_layout.addWidget(self.preview, 1)
         preview_layout.addLayout(self.view_toolbar(self.preview))
-        preview_note = QLabel("A4 · 210 × 297 мм · белый фон RGB 255, 255, 255")
+        preview_note = QLabel(
+            "A4 · 210 × 297 мм · белый фон RGB 255, 255, 255\n"
+            "Перетащите карточку — сдвинется вся группа. Привязка к центру: 0,8 мм. Esc — отмена."
+        )
+        preview_note.setWordWrap(True)
         set_widget_property(preview_note, "status", "muted")
         preview_layout.addWidget(preview_note)
         self.tabs.addTab(preview_tab, "Предпросмотр A4")
@@ -789,6 +808,9 @@ class MainWindow(QMainWindow):
         form.addRow("Минимальные поля", self.margin)
         form.addRow("Смещение X →", self.offset_x)
         form.addRow("Смещение Y ↓", self.offset_y)
+        self.crop_marks_toggle = QCheckBox("Метки реза")
+        self.crop_marks_toggle.setToolTip("Печатать метки реза длиной 3 мм, толщиной 0,15 мм")
+        form.addRow(self.crop_marks_toggle)
         note = QLabel("Группа карточек центрируется на листе. Смещения отсчитываются от центра.")
         note.setWordWrap(True)
         set_widget_property(note, "status", "muted")
@@ -832,6 +854,7 @@ class MainWindow(QMainWindow):
         for spin in (self.width, self.height, self.radius):
             spin.valueChanged.connect(self.card_options_changed)
         self.template.currentIndexChanged.connect(self.layout_options_changed)
+        self.crop_marks_toggle.toggled.connect(self.layout_options_changed)
         for spin in (self.gap, self.margin, self.offset_x, self.offset_y):
             spin.valueChanged.connect(self.layout_options_changed)
 
@@ -950,6 +973,7 @@ class MainWindow(QMainWindow):
         self.editor.set_canvas_color(palette.canvas_bg)
         self.editor.set_accent_color(palette.accent)
         self.preview.set_canvas_color(palette.canvas_bg)
+        self.preview.set_accent_color(palette.accent)
         for inspector in list(self.inspectors):
             inspector.view.set_canvas_color(palette.canvas_bg)
         if self.active_side not in self.cards:
@@ -1558,11 +1582,16 @@ class MainWindow(QMainWindow):
             self.refresh_sheet()
 
     def is_drafting(self) -> bool:
-        return self.draft_message is not None or self.editor.is_drafting
+        return (
+            self.draft_message is not None
+            or self.editor.is_drafting
+            or self.preview.is_layout_dragging
+        )
 
     def _clear_draft(self) -> bool:
         had_draft = self.is_drafting()
         self.editor.cancel_draft(emit=False)
+        self.preview.cancel_layout_drag(emit=False)
         self.draft_message = None
         self.draft_side = None
         return had_draft
@@ -1602,6 +1631,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"✕ {error}" if error else self.draft_message or "")
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.preview.is_layout_dragging:
+            self.preview.cancel_layout_drag()
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Escape and self.editor.is_drafting:
             self.editor.cancel_draft()
             event.accept()
@@ -1675,14 +1708,16 @@ class MainWindow(QMainWindow):
             f"После перспективы: {w} × {h} пикс.\nПри печати: ≈ {dpi:.0f} DPI.\nУвеличение размера не добавляет деталей."
         )
 
-    def invalidate_sheet(self, message="Обновление предпросмотра…"):
+    def invalidate_sheet(self, message="Обновление предпросмотра…", *, keep_preview=False):
+        if self.preview.is_layout_dragging and not keep_preview:
+            self._clear_draft()
         self.layout_generation += 1
         self.sheet = None
         self.pdf_button.setEnabled(False)
         self.png_button.setEnabled(False)
         self.layout_message.setText(message)
         set_widget_property(self.layout_message, "status", "")
-        self.preview.setEnabled(False)
+        self.preview.setEnabled(keep_preview)
         self.tabs.setTabText(1, "Предпросмотр A4 · обновление")
 
     def selection_changed(self, points):
@@ -1879,17 +1914,42 @@ class MainWindow(QMainWindow):
         self.submit(work, done, failed)
 
     def current_layout(self):
+        if self.preview.is_layout_dragging:
+            return self.preview.committed_layout
         return Layout(
             self.template.currentData(),
             self.gap.value(),
             self.margin.value(),
             self.offset_x.value(),
             self.offset_y.value(),
+            self.crop_marks_toggle.isChecked(),
         )
+
+    def on_layout_drag_started(self):
+        self.draft_message = "Перемещение карточек… Экспорт приостановлен. Esc — отмена."
+        self.draft_side = None
+        self.layout_timer.stop()
+        self.invalidate_sheet(self.draft_message, keep_preview=True)
+
+    def on_layout_moved(self, layout):
+        self.syncing = True
+        try:
+            self.offset_x.setValue(layout.offset_x_mm)
+            self.offset_y.setValue(layout.offset_y_mm)
+        finally:
+            self.syncing = False
+
+    def on_layout_drag_finished(self, changed):
+        self.draft_message = self.draft_side = None
+        if changed:
+            self._record_history("Перемещение карточек на A4")
+        self.layout_changed()
 
     def layout_options_changed(self):
         if self.syncing or self._closing or self._closed:
             return
+        if self.preview.is_layout_dragging:
+            self._clear_draft()
         self._record_history("Компоновка A4")
         self.layout_changed()
 
@@ -1994,6 +2054,7 @@ class MainWindow(QMainWindow):
             self.margin.setValue(snapshot.layout.margin_mm)
             self.offset_x.setValue(snapshot.layout.offset_x_mm)
             self.offset_y.setValue(snapshot.layout.offset_y_mm)
+            self.crop_marks_toggle.setChecked(snapshot.layout.crop_marks)
             if self.active_side not in self.cards and self.cards:
                 next_side = next(iter(self.cards))
                 self.active_side = next_side
@@ -2017,6 +2078,8 @@ class MainWindow(QMainWindow):
     def layout_changed(self):
         if self.syncing or self._closing or self._closed:
             return
+        if self.preview.is_layout_dragging:
+            self._clear_draft()
         if self.is_drafting():
             self.layout_timer.stop()
             self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
@@ -2027,6 +2090,8 @@ class MainWindow(QMainWindow):
 
     def refresh_sheet(self):
         if self._closing or self._closed:
+            return
+        if self.preview.is_layout_dragging:
             return
         if self.is_drafting():
             self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
@@ -2045,7 +2110,7 @@ class MainWindow(QMainWindow):
             return
         if not self.cards:
             self.invalidate_sheet("Назначьте стороны документа.")
-            self.preview.set_image(Image.new("RGB", (420, 594), "white"))
+            self.preview.clear_sheet()
             self.tabs.setTabText(1, "Предпросмотр A4")
             return
         if any(card.ready_revision != card.revision for card in self.cards.values()):
@@ -2055,8 +2120,13 @@ class MainWindow(QMainWindow):
             sizes = {
                 side: card.size.resolve(card.rendered.size) for side, card in self.cards.items()
             }
-            placements = arrange(sizes, self.current_layout())
-            sheet = Sheet({side: card.rendered for side, card in self.cards.items()}, placements)
+            layout = self.current_layout()
+            placements = arrange(sizes, layout)
+            sheet = Sheet(
+                {side: card.rendered for side, card in self.cards.items()},
+                placements,
+                crop_marks=layout.crop_marks,
+            )
         except ValueError as exc:
             self.layout_message.setText(f"✕ {exc}")
             set_widget_property(self.layout_message, "status", "error")
@@ -2072,7 +2142,7 @@ class MainWindow(QMainWindow):
             ):
                 return
             self.sheet = sheet
-            self.preview.set_image(preview)
+            self.preview.set_sheet(preview, sheet.placements, layout)
             self.preview.setEnabled(True)
             self.pdf_button.setEnabled(True)
             self.png_button.setEnabled(True)
@@ -2085,6 +2155,10 @@ class MainWindow(QMainWindow):
                 if side in self.cards and side in self._needs_contour_review
             ]
             header = f"✓ Готово к экспорту · На листе: {count} из 2 сторон."
+            if sheet.crop_marks:
+                warning = crop_marks(sheet.placements).warning
+                if warning:
+                    header += "\n" + warning
             if review_sides:
                 header += (
                     "\n⚠ Проверьте автоматически найденные границы ("
@@ -2257,7 +2331,7 @@ class MainWindow(QMainWindow):
         )
         card_paths = tuple(card.source.path for card in self.cards.values())
         snap = snapshot_sheet(self.sheet, revisions=revisions, source_fingerprints=source_fps)
-        frozen_sheet = Sheet(dict(snap.images), list(snap.placements))
+        frozen_sheet = Sheet(dict(snap.images), list(snap.placements), crop_marks=snap.crop_marks)
         self._save_generation += 1
         save_gen = self._save_generation
 

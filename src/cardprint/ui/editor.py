@@ -16,6 +16,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
+    QGraphicsLineItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsPolygonItem,
@@ -24,7 +25,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..geometry import ViewTransform, validate_quad
+from ..geometry import (
+    A4_HEIGHT_MM,
+    A4_WIDTH_MM,
+    Layout,
+    ViewTransform,
+    arrange,
+    crop_marks,
+    position_group,
+    validate_quad,
+)
 
 CORNER_LABELS = ("верхний левый", "верхний правый", "нижний правый", "нижний левый")
 CORNER_ARROWS = ("↖", "↗", "↘", "↙")
@@ -515,3 +525,242 @@ class ImageView(QGraphicsView):
             self.fit_image()
         self.loupe.hide()
         self.update_loupe()
+
+
+class SheetView(ImageView):
+    """A4 scene in millimetres; derived card pixmaps move without rerasterizing."""
+
+    layoutDragStarted = Signal()
+    layoutMoved = Signal(object)
+    layoutDragFinished = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self.rulers_visible = True
+        self.guides_visible = True
+        self.sheet_layout = Layout()
+        self.placements = []
+        self.card_items = {}
+        self.mark_items = []
+        self._drag_start = None
+        self._drag_layout = None
+        self.clear_sheet()
+
+    @property
+    def is_layout_dragging(self):
+        return self._drag_start is not None
+
+    @property
+    def committed_layout(self):
+        return self._drag_layout if self.is_layout_dragging else self.sheet_layout
+
+    def clear_sheet(self):
+        self.cancel_layout_drag(emit=False)
+        self.card_items = {}
+        self.mark_items = []
+        self.placements = []
+        self.set_image(Image.new("RGB", (210, 297), "white"), (A4_WIDTH_MM, A4_HEIGHT_MM))
+
+    def set_sheet(self, image, placements, layout):
+        preserve_view = bool(self.placements) and not self.auto_fit
+        transform = self.transform()
+        centre = self.mapToScene(self.viewport().rect().center())
+        self.clear_sheet()
+        self.sheet_layout = layout
+        self.placements = placements
+        rendered = pixmap(image)
+        scale = 120 / 25.4  # render_sheet's preview DPI; scene positions stay in mm.
+        for p in placements:
+            x, y = round(p.x_mm * scale), round(p.y_mm * scale)
+            right = round((p.x_mm + p.width_mm) * scale)
+            bottom = round((p.y_mm + p.height_mm) * scale)
+            item = QGraphicsPixmapItem(rendered.copy(x, y, right - x, bottom - y))
+            item.setTransform(
+                QTransform.fromScale(p.width_mm / (right - x), p.height_mm / (bottom - y))
+            )
+            item.setPos(p.x_mm, p.y_mm)
+            item.setZValue(2)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self.scene().addItem(item)
+            self.card_items[p.side] = item
+        self._update_marks()
+        if preserve_view:
+            self.setTransform(transform)
+            self.centerOn(centre)
+            self.auto_fit = False
+        self.viewport().update()
+
+    def set_rulers_visible(self, visible):
+        self.rulers_visible = visible
+        if self.auto_fit:
+            self.fit_image()
+        self.viewport().update()
+
+    def set_guides_visible(self, visible):
+        self.guides_visible = visible
+        self.viewport().update()
+
+    def _update_marks(self):
+        for item in self.mark_items:
+            self.scene().removeItem(item)
+        self.mark_items = []
+        if self.sheet_layout.crop_marks:
+            for mark in crop_marks(self.placements).segments:
+                item = QGraphicsLineItem(*mark.start, *mark.end)
+                pen = QPen(QColor("#000000"), mark.width_mm)
+                pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+                item.setPen(pen)
+                item.setZValue(1)
+                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self.scene().addItem(item)
+                self.mark_items.append(item)
+
+    def _move_layout(self, layout):
+        sizes = {p.side: (p.width_mm, p.height_mm) for p in self.placements}
+        self.sheet_layout = layout
+        self.placements = arrange(sizes, layout)
+        for p in self.placements:
+            self.card_items[p.side].setPos(p.x_mm, p.y_mm)
+        self._update_marks()
+        self.layoutMoved.emit(layout)
+        self.viewport().update()
+
+    def mousePressEvent(self, event):
+        point = QPointF(*self.viewport_to_source(event.position()))
+        on_ruler = self.rulers_visible and (event.position().x() < 28 or event.position().y() < 24)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not on_ruler
+            and any(
+                QRectF(p.x_mm, p.y_mm, p.width_mm, p.height_mm).contains(point)
+                for p in self.placements
+            )
+        ):
+            self._drag_start = point
+            self._drag_layout = self.sheet_layout
+            self.setFocus()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.layoutDragStarted.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.is_layout_dragging:
+            delta = QPointF(*self.viewport_to_source(event.position())) - self._drag_start
+            sizes = {p.side: (p.width_mm, p.height_mm) for p in self.placements}
+            self._move_layout(
+                position_group(
+                    sizes,
+                    self._drag_layout,
+                    self._drag_layout.offset_x_mm + delta.x(),
+                    self._drag_layout.offset_y_mm + delta.y(),
+                )
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.is_layout_dragging and event.button() == Qt.MouseButton.LeftButton:
+            self.mouseMoveEvent(event)
+            changed = self.sheet_layout != self._drag_layout
+            self._drag_start = self._drag_layout = None
+            self.viewport().unsetCursor()
+            self.layoutDragFinished.emit(changed)
+            self.viewport().update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def cancel_layout_drag(self, *, emit=True):
+        if not self.is_layout_dragging:
+            return False
+        origin = self._drag_layout
+        self._drag_start = self._drag_layout = None
+        self._move_layout(origin)
+        self.viewport().unsetCursor()
+        if emit:
+            self.layoutDragFinished.emit(False)
+        return True
+
+    def keyPressEvent(self, event):
+        if self.is_layout_dragging and event.key() == Qt.Key.Key_Escape:
+            self.cancel_layout_drag()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event):
+        self.cancel_layout_drag()
+        super().focusOutEvent(event)
+
+    def wheelEvent(self, event):
+        if self.is_layout_dragging:
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def fit_image(self):
+        if getattr(self, "rulers_visible", False) and self.image_item:
+            # Keep the full paper clear of the viewport ruler strips even at 280×240.
+            scale = min(
+                self.viewport().width() / A4_WIDTH_MM, self.viewport().height() / A4_HEIGHT_MM
+            )
+            padding = 40 / max(scale, 0.01)
+            self.fitInView(
+                QRectF(0, 0, A4_WIDTH_MM, A4_HEIGHT_MM).adjusted(
+                    -padding, -padding, padding, padding
+                ),
+                Qt.AspectRatioMode.KeepAspectRatio,
+            )
+            self.auto_fit = True
+        else:
+            super().fit_image()
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        if self.guides_visible:
+            pen = QPen(QColor("#64748b"), 1, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            m = self.sheet_layout.margin_mm
+            painter.drawRect(QRectF(m, m, A4_WIDTH_MM - 2 * m, A4_HEIGHT_MM - 2 * m))
+        if self.is_layout_dragging:
+            pen = QPen(self._accent_color, 1, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            if self.sheet_layout.offset_x_mm == 0:
+                painter.drawLine(QPointF(105, 0), QPointF(105, 297))
+            if self.sheet_layout.offset_y_mm == 0:
+                painter.drawLine(QPointF(0, 148.5), QPointF(210, 148.5))
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.rulers_visible:
+            return
+        painter = QPainter(self.viewport())
+        painter.fillRect(0, 0, self.viewport().width(), 24, self.palette().window())
+        painter.fillRect(0, 0, 28, self.viewport().height(), self.palette().window())
+        painter.setPen(self.palette().windowText().color())
+        font = painter.font()
+        font.setPixelSize(10)
+        painter.setFont(font)
+        scale = self.transform().m11()
+        step = 1 if scale >= 4 else 5 if scale >= 1 else 10 if scale >= 0.5 else 50
+        label_width = painter.fontMetrics().horizontalAdvance("297") + 8
+        major = next((n for n in (10, 20, 50, 100) if n * scale >= label_width), 100)
+        for mm in range(0, 211, step):
+            x = self.mapFromScene(QPointF(mm, 0)).x()
+            if 28 <= x < self.viewport().width():
+                painter.drawLine(x, 24, x, 17 if mm % major == 0 else 21)
+                if mm % major == 0:
+                    painter.drawText(x + 2, 12, str(mm))
+        for mm in range(0, 298, step):
+            y = self.mapFromScene(QPointF(0, mm)).y()
+            if 24 <= y < self.viewport().height():
+                painter.drawLine(28, y, 22 if mm % major == 0 else 25, y)
+                if mm % major == 0:
+                    painter.drawText(1, y - 2, str(mm))
+        painter.drawText(3, 13, "мм")

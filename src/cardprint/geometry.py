@@ -1,13 +1,14 @@
 """Image coordinates (pixels) and print geometry (millimetres) are separate types."""
 
-from dataclasses import dataclass
-from math import hypot, isfinite
+from dataclasses import dataclass, replace
+from math import ceil, floor, hypot, isfinite
 
 Point = tuple[float, float]
 Quad = tuple[Point, Point, Point, Point]  # TL, TR, BR, BL in rotated source pixels
 A4_WIDTH_MM = 210.0
 A4_HEIGHT_MM = 297.0
 MM_TO_PT = 72 / 25.4
+CROP_MARK_WIDTH_MM = 0.15
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ class Layout:
     margin_mm: float = 10
     offset_x_mm: float = 0
     offset_y_mm: float = 0
+    crop_marks: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,94 @@ class Placement:
     y_mm: float  # measured from top of the A4 sheet
     width_mm: float
     height_mm: float
+
+
+@dataclass(frozen=True)
+class CropMark:
+    start: Point
+    end: Point
+    width_mm: float = CROP_MARK_WIDTH_MM
+
+
+@dataclass(frozen=True)
+class CropMarks:
+    segments: tuple[CropMark, ...] = ()
+    omitted: int = 0
+
+    @property
+    def warning(self) -> str:
+        return (
+            f"⚠ Пропущено меток реза: {self.omitted}. Недостаточно места до края листа "
+            "или соседней карточки. Размеры карточек сохранены."
+            if self.omitted
+            else ""
+        )
+
+
+def crop_marks(placements: list[Placement]) -> CropMarks:
+    """3 mm marks, 1 mm away from corners; omit unsafe strokes in their entirety."""
+    segments = []
+    omitted = 0
+    for card in placements:
+        left, top = card.x_mm, card.y_mm
+        right, bottom = left + card.width_mm, top + card.height_mm
+        for x, direction_x in ((left, -1), (right, 1)):
+            for y, direction_y in ((top, -1), (bottom, 1)):
+                candidates = (
+                    CropMark((x + direction_x, y), (x + 4 * direction_x, y)),
+                    CropMark((x, y + direction_y), (x, y + 4 * direction_y)),
+                )
+                for segment in candidates:
+                    half = segment.width_mm / 2
+                    x0 = min(segment.start[0], segment.end[0]) - half
+                    x1 = max(segment.start[0], segment.end[0]) + half
+                    y0 = min(segment.start[1], segment.end[1]) - half
+                    y1 = max(segment.start[1], segment.end[1]) + half
+                    unsafe = x0 < 0 or y0 < 0 or x1 > A4_WIDTH_MM or y1 > A4_HEIGHT_MM
+                    unsafe = unsafe or any(
+                        x0 <= p.x_mm + p.width_mm
+                        and x1 >= p.x_mm
+                        and y0 <= p.y_mm + p.height_mm
+                        and y1 >= p.y_mm
+                        for p in placements
+                    )
+                    if unsafe:
+                        omitted += 1
+                    elif segment not in segments:
+                        segments.append(segment)
+    return CropMarks(tuple(segments), omitted)
+
+
+def position_group(
+    sizes: dict[str, tuple[float, float]],
+    layout: Layout,
+    x: float,
+    y: float,
+    *,
+    snap_mm: float = 0.8,
+) -> Layout:
+    """Clamp a gesture to arrange's margins, in the controls' 0.01 mm precision."""
+    if not all(isfinite(value) for value in (x, y, snap_mm)) or snap_mm < 0:
+        raise ValueError("Некорректное смещение группы карточек.")
+    centred = arrange(sizes, replace(layout, offset_x_mm=0, offset_y_mm=0))
+    left = min(p.x_mm for p in centred)
+    top = min(p.y_mm for p in centred)
+    right = max(p.x_mm + p.width_mm for p in centred)
+    bottom = max(p.y_mm + p.height_mm for p in centred)
+
+    def clamp(value, low, high):
+        if abs(value) <= snap_mm:
+            value = 0.0
+        low, high = ceil((low - 1e-7) * 100) / 100, floor((high + 1e-7) * 100) / 100
+        return max(low, min(high, round(value, 2)))
+
+    result = replace(
+        layout,
+        offset_x_mm=clamp(x, layout.margin_mm - left, A4_WIDTH_MM - layout.margin_mm - right),
+        offset_y_mm=clamp(y, layout.margin_mm - top, A4_HEIGHT_MM - layout.margin_mm - bottom),
+    )
+    arrange(sizes, result)
+    return result
 
 
 def arrange(sizes: dict[str, tuple[float, float]], layout: Layout) -> list[Placement]:

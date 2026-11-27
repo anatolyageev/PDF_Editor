@@ -50,7 +50,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 | `T-02` | M1 · Foundation & UX | Add Light/Dark QSS theme system (`ui/theme.py`) and SVG icon helper (`ui/icons.py`) | `DONE` | `T-01`, `T-20` |
 | `T-03` | M1 · Foundation & UX | Add drag-and-drop import, visual Front/Back slot cards, and source badges | `DONE` | `T-02` |
 | `T-04` | M1 · Foundation & UX | Upgrade corner editor UX (mask, numbered handles, live error, loupe, shortcuts) | `DONE` | `T-02`, `T-18`, `T-19` |
-| `T-06` | M1 · Foundation & UX | Upgrade A4 preview (mm rulers, margin guides, crop marks, drag-to-offset) | `TODO` | `T-02`, `T-05` |
+| `T-06` | M1 · Foundation & UX | Upgrade A4 preview (mm rulers, margin guides, crop marks, drag-to-offset) | `DONE` | `T-02`, `T-05` |
 | `T-07` | M2 · Text on A4 | Add Cyrillic TTF font resolver (`fonts.py`), `TextAnnotation`, and shared text export | `TODO` | `T-01`, `T-19` |
 | `T-08` | M2 · Text on A4 | Add interactive A4 text & watermark editing UI with presets and Undo/Redo | `TODO` | `T-05`, `T-06`, `T-07` |
 | `T-09` | M3 · PDF Editor Mode | Add dual-mode workspace shell using shared save guards | `TODO` | `T-02`, `T-20`, `T-21` |
@@ -237,7 +237,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-06`: Upgrade A4 preview (mm rulers, margin guides, crop marks, drag-to-offset)
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-02`, `T-05`
 - **Goal:** Turn the A4 preview into a precise print-layout surface with guides, direct mouse positioning, and optional crop marks rendered identically in preview and exports.
 - **Target files:**
@@ -254,8 +254,9 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - Dragging the card group with the mouse on the A4 preview updates `offset_x_mm` and `offset_y_mm` (clamped or validated identically by `arrange`), snaps gently to `0.0 mm` center axes, and records one Undo step on release.
   - Tests verify crop marks presence in exported PNG/PDF when enabled and absence when disabled, plus mouse drag offset synchronization.
 - **Verification:**
-  - `uv run pytest -q tests/test_geometry.py tests/test_export.py tests/test_ui.py`
-  - `uv run pytest -q && uv run ruff check src tests scripts && uv run ruff format --check src tests scripts`
+  - `uv run pytest -q tests/test_geometry.py tests/test_export.py tests/test_ui.py`: **75 passed** (`offscreen`).
+  - `uv run pytest -q`: **99 passed**, one previously observed `BytesIO` finalization warning (see [PROJECT_STATUS.md](PROJECT_STATUS.md)); Ruff check passed; format check: **22 files already formatted**.
+  - A4 drag/guide tests at `QT_SCALE_FACTOR=1.25` and `1.5`: **3 passed each**, Qt `offscreen`. Light/Dark artificial A4 previews at 1280 × 720 visually inspected. Native display/Windows scaling and physical printing remain unverified.
 
 ---
 

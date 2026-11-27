@@ -21,12 +21,12 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 | [app.py](../src/cardprint/app.py) | QApplication, `multiprocessing.freeze_support()`, Russian locale, Fusion style, persisted Light/Dark theme startup, Wayland selection when its socket is available, and MainWindow startup. |
 | [pdf_worker.py](../src/cardprint/pdf_worker.py) | Single spawned PyMuPDF child process, serializable IPC requests/results, request coalescing, crash recovery, and byte-bounded `ByteLRUCache` (32 MiB thumbnails / 128 MiB display pages). No Qt dependency. |
 | [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, batched PDF discovery via `pdf_worker`, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt or top-level PyMuPDF dependency. |
-| [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, and arrange. Independent of the UI. |
+| [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, arrange, position_group, and safe millimetre crop-mark segments. Independent of the UI. |
 | [model.py](../src/cardprint/model.py) | Pure-Python domain models (`Card`, `SIDE_NAMES`), memory-bounded parametric `UndoStack` (`CardSnapshot`, `WorkspaceSnapshot`), and `WorkspaceCheckpoints` (`ExportRecord`). No Qt dependency. |
 | [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output, and staged PDF/PNG validation. No Qt dependency. |
 | [ui/theme.py](../src/cardprint/ui/theme.py) | `ThemePalette` (`light` / `dark`), `QPalette` + QSS stylesheet generation (`variant` button hierarchy, semantic `status` labels, card-style panels), and `QSettings` persistence. |
 | [ui/icons.py](../src/cardprint/ui/icons.py) | Bundled inline monochrome SVG icons rendered and palette-tinted via `QSvgRenderer` at `1×` / `2×` DPI with bounded LRU caching. |
-| [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection/nudge transactions, outside mask, live validation, numbered handles, bounded original-pixel loupe, canvas shortcuts, theme-aware colors, zoom, and pan. |
+| [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection/nudge transactions, outside mask, live validation, numbered handles, bounded original-pixel loupe, canvas shortcuts, theme-aware colors, zoom, and pan; `SheetView` adds an A4 mm scene, rulers/margin guides, and transactional group positioning. |
 | [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, `SourceListWidget`, `SideSlotCard` slots with `Лиц.` / `Обр.` badges, drag-and-drop file/thumbnail import, contextual right panels, theme toggle, task coordination, and export actions. |
 | [ui/tasks.py](../src/cardprint/ui/tasks.py) | `QRunnable` `Task` for pure image work and `PdfTaskBridge` for delivering `PdfWorkerClient` results onto the GUI thread. |
 | [tests/](../tests/) | Geometry, model, worker, processing, export, and Qt integration tests using artificial data. |
@@ -54,6 +54,10 @@ additional persistence layer or a general-purpose PDF editing engine exists.
    creates `Placement` objects and validates A4 bounds and margins. The placements
    and `rendered` images form a `Sheet`.
 6. `render_sheet` creates the screen preview at 120 DPI and PNG output at 300 DPI.
+   `Sheet.crop_marks` enables the shared safe segment set in both raster rendering
+   and vector PDF output; `ExportSnapshot` freezes that flag with the placements.
+   `SheetView` extracts reduced card pixmaps from the 120 DPI preview and positions
+   them in an A4 millimetre scene, drawing crop marks from those same segments.
    `_write_pdf` uses the same images and placements, retaining the processed card's
    pixel resolution without JPEG recompression; `export_sheet` validates staged PDFs
    in `pdf_worker` (`ValidatePdfRequest`) before publishing.
@@ -73,7 +77,8 @@ of the source document. Once assigned, processing uses the loaded `Card.original
 | --- | --- |
 | Original array | `original[y, x, channel]`, top-left origin. The array is never rotated in place. |
 | Selection | Source pixels **after the logical rotation** `turns`. Order: TL → TR → BR → BL, clockwise in screen coordinates. |
-| Qt scene | One scene unit equals one rotated source pixel, even when the displayed QPixmap is reduced. |
+| Qt card editor scene | One scene unit equals one rotated source pixel, even when the displayed QPixmap is reduced. |
+| Qt A4 preview scene | One scene unit equals one millimetre; top-left paper origin, independent zoom/pan and non-exported viewport rulers. |
 | Qt viewport | Zoom and pan belong to the view. ViewTransform supplies forward and inverse mappings. |
 | Sheet | Millimeters, top-left origin; A4 = 210 × 297 mm. |
 | PDF | Points: `mm * 72 / 25.4`, bottom-left origin. Convert Y using `(297 - y_mm - height_mm) * MM_TO_PT`. |
@@ -118,6 +123,33 @@ with Shift); these do not intercept text/spinbox input. A held arrow uses the sa
 draft/export guard as a mouse drag and commits once on non-repeat key release or
 focus loss. Escape restores its committed origin. Window-level `Ctrl+O` / `Ctrl+S`
 activate the existing import/export buttons, including their disabled-state guards.
+
+## A4 preview and crop marks
+
+`Layout.crop_marks` defaults to false. `geometry.crop_marks(placements)` returns
+immutable `CropMark` segments in mm plus an omitted count and Russian warning.
+Each candidate is 3 mm long, separated from a card corner by 1 mm, with a 0.15 mm
+stroke. Its stroke bounding box must stay inside A4 and outside every card;
+unsafe candidates are omitted whole, never clipped or accommodated by changing
+card geometry. `render_sheet` paints marks before cards with pixel-grid rounding
+(120 DPI preview / 300 DPI PNG); `_write_pdf` writes vector lines with the same
+coordinates and width. Quantization and antialiasing can differ between renderers.
+
+`SheetView` holds reduced card pixmaps and mm placements on pure-white paper.
+Rulers use the viewport transform and adaptive tick labels; margin/snap guides
+are painted in the foreground. Those guides never enter `Sheet` or exports, and
+toggling their visibility does not change history or dirty checkpoints. A layout
+refresh preserves manually chosen zoom/pan.
+
+A mouse press on a card starts a group-position transaction. Only pixmap positions
+and the small crop-mark set change during motion. `position_group` clamps to the
+same margin contract as `arrange`, quantizes within valid bounds to the controls'
+0.01 mm precision, and snaps offsets within 0.8 mm to zero. Export is suspended;
+controls show the draft offsets, while `current_layout` returns the committed
+layout until release. One release records one history step and schedules one
+background preview; card processing is not repeated. Escape, focus loss, source
+or layout invalidation cancel the gesture. `layout_generation` rejects any preview
+started before the drag, and a modal export keeps its captured crop-mark flag.
 
 ## Background tasks and result freshness
 

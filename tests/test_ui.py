@@ -1811,3 +1811,166 @@ def test_open_save_shortcuts_honor_export_draft_guard(qtbot, tmp_path, synthetic
     assert saved == [True] and target.exists()
     assert not window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
     window.close()
+
+
+def test_a4_drag_updates_mm_offsets_once_with_undo_cancel_and_stale_guard(
+    qtbot, tmp_path, synthetic_card
+):
+    from cardprint.geometry import position_group
+
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    window.tabs.setCurrentIndex(1)
+    view = window.preview
+    qtbot.waitUntil(view.isVisible)
+    view.zoom(1.5)
+    view.horizontalScrollBar().setValue(view.horizontalScrollBar().value() + 7)
+    view.verticalScrollBar().setValue(view.verticalScrollBar().value() + 11)
+    original = window.current_layout()
+    depth = window.history.undo_depth
+    card = window.cards["front"]
+    revision = card.revision
+    p = window.sheet.placements[0]
+    point = QPointF(p.x_mm + p.width_mm / 2, p.y_mm + p.height_mm / 2)
+    start = view.mapFromScene(point)
+    dest = view.mapFromScene(point + QPointF(12, -8))
+    delta = view.mapToScene(dest) - view.mapToScene(start)
+    expected = position_group({"front": (p.width_mm, p.height_mm)}, original, delta.x(), delta.y())
+    # Queue an old preview result before beginning the gesture.
+    window.refresh_sheet()
+    assert len(controller.pending) == 1
+    qtbot.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    assert view.is_layout_dragging and window.is_drafting()
+    assert window.sheet is None and not window.pdf_button.isEnabled()
+    controller.complete_at(0)
+    assert window.sheet is None  # Late result must not restore export or replace the drag.
+    qtbot.mouseMove(view.viewport(), dest)
+    assert window.offset_x.value() == expected.offset_x_mm
+    assert window.offset_y.value() == expected.offset_y_mm
+    assert window.current_layout() == original  # Live controls remain a draft.
+    assert window.history.undo_depth == depth and not controller.pending
+    assert view.card_items["front"].pos().x() == pytest.approx(p.x_mm + expected.offset_x_mm)
+    scale = view.transform().m11()
+    qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=dest)
+    assert window.history.undo_depth == depth + 1
+    controller.drain()
+    assert window.current_layout() == expected and window.sheet is not None
+    assert view.transform().m11() == pytest.approx(scale)  # Refresh preserves zoom.
+    assert card.revision == revision  # Layout movement never reprocesses source pixels.
+    window.undo()
+    controller.drain()
+    assert window.current_layout() == original
+    window.redo()
+    controller.drain()
+    assert window.current_layout() == expected
+    # Escape restores both controls and graphics, adding no history step.
+    p = window.sheet.placements[0]
+    start = view.mapFromScene(QPointF(p.x_mm + 20, p.y_mm + 20))
+    dest = start + view.mapFromScene(QPointF(5, 4)) - view.mapFromScene(QPointF(0, 0))
+    depth = window.history.undo_depth
+    qtbot.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    qtbot.mouseMove(view.viewport(), dest)
+    qtbot.keyClick(view, Qt.Key.Key_Escape)
+    qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=dest)
+    controller.drain()
+    assert window.current_layout() == expected and window.history.undo_depth == depth
+    assert window.pdf_button.isEnabled() and not view.is_layout_dragging
+    window.close()
+
+
+def test_a4_drag_snaps_clamps_and_cancels_on_layout_change(qtbot, tmp_path, synthetic_card):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    window.tabs.setCurrentIndex(1)
+    view = window.preview
+    view.zoom(2)
+    window.offset_x.setValue(3)
+    window.offset_y.setValue(3)
+    controller.drain()
+    p = window.sheet.placements[0]
+    point = QPointF(p.x_mm + 25, p.y_mm + 25)
+    start = view.mapFromScene(point)
+    near_centre = view.mapFromScene(point - QPointF(3, 3))
+    qtbot.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    qtbot.mouseMove(view.viewport(), near_centre)
+    assert view.sheet_layout.offset_x_mm == view.sheet_layout.offset_y_mm == 0
+    # Use direct Qt events for an off-viewport drag, as under a native mouse grab.
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QMouseEvent
+
+    far = QPointF(start.x() + 3000, start.y() + 3000)
+    QApplication.sendEvent(
+        view.viewport(),
+        QMouseEvent(
+            QEvent.Type.MouseMove,
+            far,
+            far,
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        ),
+    )
+    for card in view.placements:
+        assert card.x_mm >= 10 and card.y_mm >= 10
+        assert card.x_mm + card.width_mm <= 200 + 1e-7
+        assert card.y_mm + card.height_mm <= 287 + 1e-7
+    assert not controller.pending
+    # An independent layout change aborts the gesture instead of keeping partial offsets.
+    depth = window.history.undo_depth
+    window.gap.setValue(22)
+    assert not view.is_layout_dragging
+    assert window.offset_x.value() == window.offset_y.value() == 3
+    assert window.history.undo_depth == depth + 1
+    qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=near_centre)
+    controller.drain()
+    assert window.current_layout().gap_mm == 22 and window.sheet is not None
+    window.close()
+
+
+def test_a4_guides_are_view_only_crop_marks_undo_and_captured_export(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    from cardprint.geometry import crop_marks
+
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    window.tabs.setCurrentIndex(1)
+    snapshot = window.current_workspace_snapshot()
+    depth = window.history.undo_depth
+    sheet = window.sheet
+    window.rulers_toggle.setChecked(False)
+    window.guides_toggle.setChecked(False)
+    assert not window.preview.rulers_visible and not window.preview.guides_visible
+    assert window.current_workspace_snapshot() == snapshot
+    assert window.history.undo_depth == depth and window.sheet is sheet
+    window.crop_marks_toggle.setChecked(True)
+    controller.drain()
+    assert window.sheet.crop_marks and len(window.preview.mark_items) == 8
+    assert window.history.undo_depth == depth + 1
+    window.undo()
+    controller.drain()
+    assert not window.crop_marks_toggle.isChecked() and not window.sheet.crop_marks
+    assert not window.preview.mark_items
+    window.redo()
+    controller.drain()
+    target = tmp_path / "captured-marks.pdf"
+
+    def dialog(*args, **kwargs):
+        window.crop_marks_toggle.setChecked(False)
+        return str(target), ""
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", dialog)
+    window.save("pdf")
+    controller.drain()
+    with pymupdf.open(target) as pdf:
+        marks = [d for d in pdf[0].get_drawings() if d["items"][0][0] == "l"]
+        assert len(marks) == 8  # Snapshot captured the enabled option before the dialog.
+    assert not window.sheet.crop_marks
+    assert window.checkpoints.is_last_export_stale(window.current_workspace_snapshot())
+    # At zero margin on the sheet edge, unsafe marks are omitted, export stays available.
+    window.margin.setValue(0)
+    window.offset_x.setValue(-(210 - 85.6) / 2)
+    window.crop_marks_toggle.setChecked(True)
+    controller.drain()
+    omitted = crop_marks(window.sheet.placements)
+    assert omitted.omitted > 0 and omitted.warning in window.layout_message.text()
+    assert len(window.preview.mark_items) == len(omitted.segments)
+    assert window.pdf_button.isEnabled()
+    window.close()

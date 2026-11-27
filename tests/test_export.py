@@ -301,3 +301,48 @@ def test_export_sheet_non_ui_protects_discovered_original_and_validates_png_and_
     assert not out_pdf.exists()
     # Keep unused shutil import used in module-level verification cleanly.
     assert shutil is not None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_crop_marks_shared_preview_png_vector_pdf_and_snapshot(tmp_path, enabled):
+    from cardprint.export import snapshot_sheet
+    from cardprint.geometry import crop_marks
+
+    layout = Layout(crop_marks=enabled)
+    placements = arrange({"front": (85.6, 53.98), "back": (75, 45)}, layout)
+    images = {
+        "front": Image.new("RGB", (856, 540), (60, 120, 180)),
+        "back": Image.new("RGB", (750, 450), (170, 80, 40)),
+    }
+    sheet = Sheet(images, placements, crop_marks=enabled)
+    snapshot = snapshot_sheet(sheet)
+    assert snapshot.crop_marks is enabled
+    frozen = Sheet(snapshot.images, list(snapshot.placements), snapshot.crop_marks)
+    png = tmp_path / "marks.png"
+    pdf = tmp_path / "marks.pdf"
+    export_sheet(frozen, png, "png")
+    export_sheet(frozen, pdf, "pdf")
+    marks = crop_marks(placements).segments
+    assert len(marks) == 16
+    with Image.open(png) as exported:
+        for dpi, raster in ((120, render_sheet(frozen)), (300, exported)):
+            for mark in marks:
+                x = round((mark.start[0] + mark.end[0]) / 2 * dpi / 25.4)
+                y = round((mark.start[1] + mark.end[1]) / 2 * dpi / 25.4)
+                assert raster.getpixel((x, y)) == ((0, 0, 0) if enabled else (255, 255, 255))
+            # Card pixels must be identical regardless of crop-mark setting.
+            plain = render_sheet(Sheet(images, placements), dpi)
+            for p in placements:
+                rect = tuple(
+                    round(v * dpi / 25.4)
+                    for v in (p.x_mm, p.y_mm, p.x_mm + p.width_mm, p.y_mm + p.height_mm)
+                )
+                assert raster.crop(rect).tobytes() == plain.crop(rect).tobytes()
+    with pymupdf.open(pdf) as doc:
+        lines = [drawing for drawing in doc[0].get_drawings() if drawing["items"][0][0] == "l"]
+        assert len(lines) == (len(marks) if enabled else 0)
+        for line, mark in zip(lines, marks):
+            assert line["width"] / MM_TO_PT == pytest.approx(mark.width_mm, abs=1e-5)
+            _, start, end = line["items"][0]
+            assert tuple(v / MM_TO_PT for v in start) == pytest.approx(mark.start, abs=1e-4)
+            assert tuple(v / MM_TO_PT for v in end) == pytest.approx(mark.end, abs=1e-4)
