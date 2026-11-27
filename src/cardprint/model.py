@@ -189,6 +189,20 @@ class UndoStack:
                     seen[buf_id] = int(snap.original.nbytes)
         return sum(seen.values())
 
+    def _enforce_memory_limit(self) -> tuple[int, int]:
+        evicted = 0
+        evicted_for_memory = 0
+        while self._cursor > 0 and self.history_only_bytes > self.max_bytes:
+            self._entries.pop(0)
+            self._cursor -= 1
+            evicted += 1
+            evicted_for_memory += 1
+        while len(self._entries) - 1 > self._cursor and self.history_only_bytes > self.max_bytes:
+            self._entries.pop()
+            evicted += 1
+            evicted_for_memory += 1
+        return evicted, evicted_for_memory
+
     def push(self, snapshot: WorkspaceSnapshot, label: str = "") -> PushResult:
         if snapshot == self.current:
             return PushResult(recorded=False)
@@ -197,16 +211,12 @@ class UndoStack:
         self._cursor = len(self._entries) - 1
 
         evicted = 0
-        evicted_for_memory = 0
         while self._cursor > self.max_entries:
             self._entries.pop(0)
             self._cursor -= 1
             evicted += 1
-        while self._cursor > 0 and self.history_only_bytes > self.max_bytes:
-            self._entries.pop(0)
-            self._cursor -= 1
-            evicted += 1
-            evicted_for_memory += 1
+        evicted_mem_total, evicted_for_memory = self._enforce_memory_limit()
+        evicted += evicted_mem_total
 
         self.evicted_count += evicted
         self.evicted_for_memory_count += evicted_for_memory
@@ -217,13 +227,22 @@ class UndoStack:
             return None
         label = self._entries[self._cursor].label
         self._cursor -= 1
-        return self.current, label
+        current = self.current
+        evicted, evicted_for_memory = self._enforce_memory_limit()
+        self.evicted_count += evicted
+        self.evicted_for_memory_count += evicted_for_memory
+        return current, label
 
     def redo(self) -> tuple[WorkspaceSnapshot, str] | None:
         if not self.can_redo:
             return None
         self._cursor += 1
-        return self.current, self._entries[self._cursor].label
+        label = self._entries[self._cursor].label
+        current = self.current
+        evicted, evicted_for_memory = self._enforce_memory_limit()
+        self.evicted_count += evicted
+        self.evicted_for_memory_count += evicted_for_memory
+        return current, label
 
 
 @dataclass(frozen=True)

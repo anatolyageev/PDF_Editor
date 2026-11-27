@@ -154,11 +154,54 @@ and added export support for filesystems without hard links.
 - Next ready task in [TASKS.md](TASKS.md): `T-02` (Light/Dark QSS theme system
   and SVG icon helper).
 
+### Review fixes on `optimization_fiture` (2026-11-27, post-`051d9b5`)
+
+Fixed four concurrency, snapshot-consistency, and memory/UI-responsiveness issues
+reported against commit `051d9b5` before proceeding to `T-02`:
+
+- **Stale source reload freshness (`src/cardprint/ui/window.py`):** Added per-path
+  `_reload_generation` tokens and captured side identity (`card`), `page`, and
+  `load_generation[side]` at reload start so stale photo or PDF reloads never overwrite
+  newer side assignments or compete with in-flight `pending_loads` (while still updating
+  source list thumbnails when fresh and refreshing `OriginalGuard` fingerprints via
+  `record_fingerprint`).
+- **Pre-dialog `Sheet` snapshot capture (`src/cardprint/ui/window.py`):** `MainWindow.save`
+  now captures `ExportSnapshot` (`snapshot_sheet`), `frozen_sheet`,
+  `WorkspaceSnapshot`, revisions, card paths, and source fingerprints up front before
+  background validation or modal dialogs (`QFileDialog` / overwrite `QMessageBox`),
+  preventing `AttributeError` or revision mismatches if background `autodetect` or
+  render invalidation clears `self.sheet` while a dialog is open.
+- **`UndoStack` memory budget on `undo()` / `redo()` (`src/cardprint/model.py`,
+  `src/cardprint/ui/window.py`):** Extracted `_enforce_memory_limit()` and invoked it
+  on `push()`, `undo()`, and `redo()` (evicting oldest undo entries first, then
+  farthest redo entries if needed while keeping `current` intact) so `history_only_bytes`
+  never stays above `max_bytes`; `MainWindow.undo()` and `MainWindow.redo()` disclose
+  memory trimming in the status bar.
+- **Background SHA-256 hashing & source validation (`src/cardprint/ui/window.py`):**
+  Moved synchronous GUI-thread `fingerprint_file` and `OriginalGuard.validate_source`
+  calls out of `_import_pdf_batched`, `reload_selected_source`, `assign_selected` / PDF
+  `_load_source_for_side`, and pre-dialog `save()` into background `self.submit` tasks
+  guarded by `_reload_generation`, `load_generation`, and `_save_generation`.
+- **Regression coverage:** Added 1 unit test in `tests/test_model.py` and 4 Qt UI
+  tests in `tests/test_ui.py` covering `UndoStack` `max_bytes` on `undo()`/`redo()`,
+  stale reload non-overwrite, `save()` during modal-dialog sheet invalidation, and
+  zero GUI-thread `fingerprint_file`/`validate_source` execution.
+
 ## Recorded implementation verification
 
-The following results were obtained **after completing `T-20` on 2026-11-27**
-(Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows
-and macOS remain unverified):
+The following results were obtained **after the post-`051d9b5` review fixes on
+2026-11-27** (Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native
+Windows and macOS remain unverified):
+
+| Check | Result and scope |
+| --- | --- |
+| `uv run pytest -q` | **70 passed** (`18.01s`), Qt `offscreen` (includes the 5 new regression tests in `tests/test_model.py` and `tests/test_ui.py`). |
+| `uv run ruff check src tests scripts` | All checks passed. |
+| `uv run ruff format --check src tests scripts` | 20 files already formatted. |
+
+`gui_smoke.py` was not rerun for these fixes; its latest recorded run remains from `T-19` on 2026-11-27.
+
+Previous `T-20` baseline checks (2026-11-27, commit `051d9b5`):
 
 | Check | Result and scope |
 | --- | --- |
@@ -166,8 +209,6 @@ and macOS remain unverified):
 | `uv run pytest -q` | **65 passed** (`15.39s`), including 16 Qt `offscreen` UI tests and 8 `model.py` tests. |
 | `uv run ruff check src tests scripts` | All checks passed. |
 | `uv run ruff format --check src tests scripts` | 20 files already formatted. |
-
-`gui_smoke.py` was not rerun for `T-20`; its latest recorded run remains from `T-19` on 2026-11-27.
 
 Historical **2026-11-26** `0.1.0` baseline checks (not rerun for `T-20`):
 

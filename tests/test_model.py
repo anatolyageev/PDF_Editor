@@ -160,6 +160,76 @@ def test_undo_stack_enforces_entry_cap_and_history_only_byte_budget(tmp_path):
     assert stack.evicted_for_memory_count >= 1
 
 
+def test_undo_stack_enforces_byte_budget_on_undo_and_redo(tmp_path):
+    # Reproduces the exact case where undo moves an active buffer larger than max_bytes into redo.
+    source_b = Source(path=tmp_path / "b.png", page=None, thumbnail=Image.new("RGB", (8, 5)))
+    buf_120 = np.zeros((4, 10, 3), dtype=np.uint8)
+    buf_120.flags.writeable = False
+    assert buf_120.nbytes == 120
+    card_120 = model.Card(source=source_b, original=buf_120, points=full_quad(10, 4))
+
+    initial = model.WorkspaceSnapshot((), Layout())
+    stack = model.UndoStack(initial, max_entries=10, max_bytes=100)
+    snap_120 = model.WorkspaceSnapshot.from_state({"front": card_120}, Layout())
+    assert stack.push(snap_120, "Большой снимок").recorded
+    assert stack.history_only_bytes == 0
+
+    undone = stack.undo()
+    assert undone is not None
+    assert undone[0] == initial
+    assert stack.current == initial
+    assert stack.history_only_bytes <= 100
+    assert not stack.can_redo
+    assert stack.evicted_for_memory_count >= 1
+
+    # Multi-step sequence: both undo and redo enforce max_bytes while preserving stack.current.
+    buf_80 = np.ones((4, 7, 3), dtype=np.uint8)
+    buf_80.flags.writeable = False
+    assert buf_80.nbytes == 84
+    card_80 = model.Card(
+        source=Source(path=tmp_path / "a.png", page=None, thumbnail=Image.new("RGB", (7, 4))),
+        original=buf_80,
+        points=full_quad(7, 4),
+    )
+    buf_90 = np.full((3, 10, 3), 2, dtype=np.uint8)
+    buf_90.flags.writeable = False
+    assert buf_90.nbytes == 90
+    card_90 = model.Card(
+        source=Source(path=tmp_path / "c.png", page=None, thumbnail=Image.new("RGB", (10, 3))),
+        original=buf_90,
+        points=full_quad(10, 3),
+    )
+
+    stack2 = model.UndoStack(initial, max_entries=10, max_bytes=100)
+    snap_a = model.WorkspaceSnapshot.from_state({"front": card_80}, Layout())
+    snap_a2 = model.WorkspaceSnapshot.from_state({"front": card_80}, Layout(gap_mm=20))
+    snap_c = model.WorkspaceSnapshot.from_state({"front": card_90}, Layout())
+
+    assert stack2.push(snap_a, "A1").recorded
+    assert stack2.push(snap_a2, "A2").recorded
+    assert stack2.push(snap_c, "C").recorded
+    assert stack2.history_only_bytes == 84  # snap_a/snap_a2 share buf_80
+
+    # Undo from C to A2 moves buf_90 (90B) to redo; buf_80 is active, so 90 <= 100 fits.
+    step1 = stack2.undo()
+    assert step1 is not None and step1[0] == snap_a2
+    assert stack2.history_only_bytes <= 100
+    assert stack2.can_redo
+
+    # Undo from A2 to initial makes both buf_80 (80B) and buf_90 (90B) history-only = 170B > 100B.
+    stack2.undo()
+    step2 = stack2.undo()
+    assert step2 is not None and step2[0] == initial
+    assert stack2.current == initial
+    assert stack2.history_only_bytes <= 100
+    assert stack2.evicted_for_memory_count >= 1
+
+    # Redo preserves current and keeps history_only_bytes within max_bytes.
+    while stack2.can_redo:
+        stack2.redo()
+        assert stack2.history_only_bytes <= 100
+
+
 def test_workspace_checkpoints_independent_exports_project_and_undo_to_checkpoint(tmp_path):
     initial = model.WorkspaceSnapshot((), Layout())
     checkpoints = model.WorkspaceCheckpoints(initial)

@@ -33,7 +33,6 @@ from ..export import (
     OriginalGuard,
     OriginalOverwriteError,
     Sheet,
-    SourceChangedError,
     export_sheet,
     fingerprint_file,
     render_sheet,
@@ -151,6 +150,8 @@ class MainWindow(QMainWindow):
         self.sheet = None
         self.layout_generation = 0
         self.import_generation = 0
+        self._reload_generation: dict[Path, int] = {}
+        self._save_generation = 0
         self.session_id = 1
         self._card_revision_seq = 0
         self.history = UndoStack(WorkspaceSnapshot((), Layout()))
@@ -513,72 +514,95 @@ class MainWindow(QMainWindow):
                 self._import_pdf_batched(pdf_path, import_gen)
 
     def _import_pdf_batched(
-        self, pdf_path: Path, import_gen: int, *, on_source_loaded=None
+        self,
+        pdf_path: Path,
+        import_gen: int,
+        *,
+        replace_existing: bool = False,
+        is_stale=None,
+        on_source_loaded=None,
     ) -> None:
-        try:
-            fp = fingerprint_file(pdf_path)
-        except ValueError as exc:
-            self.show_error(f"{pdf_path.name}: {exc}")
-            return
-        self.original_guard.record_fingerprint(fp)
+        resolved_pdf = pdf_path.resolve()
 
-        def request_batch(start_page: int) -> None:
-            if self._closing or self._closed:
+        def stale() -> bool:
+            return is_stale is not None and bool(is_stale())
+
+        def on_fingerprint_error(message: str) -> None:
+            if not (self._closing or self._closed) and not stale():
+                prefix = f"{pdf_path.name}:"
+                self.show_error(message if message.startswith(prefix) else f"{prefix} {message}")
+
+        def on_fingerprinted(fp) -> None:
+            if self._closing or self._closed or stale():
                 return
+            self.original_guard.record_fingerprint(fp)
 
-            def on_batch(batch: ThumbnailBatchResult) -> None:
-                if self._closing or self._closed:
+            def request_batch(start_page: int) -> None:
+                if self._closing or self._closed or stale():
                     return
-                sources = [
-                    Source(Path(batch.path), page_idx, img.to_pil(), fingerprint=fp)
-                    for page_idx, img in batch.items
-                ]
-                self._append_sources(sources)
-                if on_source_loaded is not None:
-                    for src in sources:
-                        on_source_loaded(src)
-                next_start = batch.items[-1][0] + 1 if batch.items else batch.total_pages
-                if next_start < batch.total_pages:
-                    self.statusBar().showMessage(
-                        f"Загрузка миниатюр {pdf_path.name}: {next_start} из {batch.total_pages}…"
-                    )
-                    request_batch(next_start)
-                else:
-                    self.statusBar().showMessage(
-                        f"Добавлено страниц PDF ({batch.total_pages}): {pdf_path.name}. Выберите стороны документа."
-                    )
 
-            def on_batch_error(message: str) -> None:
-                if not (self._closing or self._closed):
+                def on_batch(batch: ThumbnailBatchResult) -> None:
+                    if self._closing or self._closed or stale():
+                        return
+                    sources = [
+                        Source(Path(batch.path), page_idx, img.to_pil(), fingerprint=fp)
+                        for page_idx, img in batch.items
+                    ]
+                    self._append_sources(sources)
+                    if on_source_loaded is not None:
+                        for src in sources:
+                            on_source_loaded(src)
+                    next_start = batch.items[-1][0] + 1 if batch.items else batch.total_pages
+                    if next_start < batch.total_pages:
+                        self.statusBar().showMessage(
+                            f"Загрузка миниатюр {pdf_path.name}: {next_start} из {batch.total_pages}…"
+                        )
+                        request_batch(next_start)
+                    else:
+                        self.statusBar().showMessage(
+                            f"Добавлено страниц PDF ({batch.total_pages}): {pdf_path.name}. Выберите стороны документа."
+                        )
+
+                def on_batch_error(message: str) -> None:
+                    if not (self._closing or self._closed) and not stale():
+                        self.show_error(f"{pdf_path.name}: {message}")
+
+                self.submit_pdf(
+                    ThumbnailBatchRequest(
+                        str(pdf_path),
+                        start_page=start_page,
+                        count=DEFAULT_THUMBNAIL_BATCH_SIZE,
+                        session_id=import_gen,
+                    ),
+                    on_batch,
+                    on_batch_error,
+                )
+
+            def on_inspected(info: PdfInfo) -> None:
+                if self._closing or self._closed or stale():
+                    return
+                if replace_existing:
+                    for i in range(self.sources.count() - 1, -1, -1):
+                        if (
+                            self.sources.item(i).data(Qt.ItemDataRole.UserRole).path.resolve()
+                            == resolved_pdf
+                        ):
+                            self.sources.takeItem(i)
+                self.original_paths.add(Path(info.path))
+                self.original_guard.register(info.path)
+                request_batch(0)
+
+            def on_inspect_error(message: str) -> None:
+                if not (self._closing or self._closed) and not stale():
                     self.show_error(f"{pdf_path.name}: {message}")
 
             self.submit_pdf(
-                ThumbnailBatchRequest(
-                    str(pdf_path),
-                    start_page=start_page,
-                    count=DEFAULT_THUMBNAIL_BATCH_SIZE,
-                    session_id=import_gen,
-                ),
-                on_batch,
-                on_batch_error,
+                InspectPdfRequest(str(pdf_path), session_id=import_gen),
+                on_inspected,
+                on_inspect_error,
             )
 
-        def on_inspected(info: PdfInfo) -> None:
-            if self._closing or self._closed:
-                return
-            self.original_paths.add(Path(info.path))
-            self.original_guard.register(info.path)
-            request_batch(0)
-
-        def on_inspect_error(message: str) -> None:
-            if not (self._closing or self._closed):
-                self.show_error(f"{pdf_path.name}: {message}")
-
-        self.submit_pdf(
-            InspectPdfRequest(str(pdf_path), session_id=import_gen),
-            on_inspected,
-            on_inspect_error,
-        )
+        self.submit(lambda: fingerprint_file(pdf_path), on_fingerprinted, on_fingerprint_error)
 
     def reload_selected_source(self):
         if self._closing or self._closed:
@@ -589,17 +613,24 @@ class MainWindow(QMainWindow):
             return
         selected_source: Source = item.data(Qt.ItemDataRole.UserRole)
         target_path = selected_source.path.resolve()
-        try:
-            fp = fingerprint_file(target_path)
-        except ValueError as exc:
-            self.show_error(str(exc))
-            return
-        self.original_guard.record_fingerprint(fp)
+        reload_gen = self._reload_generation.get(target_path, 0) + 1
+        self._reload_generation[target_path] = reload_gen
+
+        def is_stale() -> bool:
+            return self._reload_generation.get(target_path) != reload_gen
+
         affected_sides = [
-            (side, card.source.page)
+            (side, card, card.source.page, self.load_generation[side])
             for side, card in self.cards.items()
             if card.source.path.resolve() == target_path
         ]
+
+        def side_still_matches(side: str, expected_card: Card, expected_load_gen: int) -> bool:
+            return (
+                self.cards.get(side) is expected_card
+                and self.load_generation[side] == expected_load_gen
+                and side not in self.pending_loads
+            )
 
         if selected_source.page is None:
 
@@ -607,36 +638,45 @@ class MainWindow(QMainWindow):
                 return discover(target_path, original_guard=self.original_guard)
 
             def done(sources):
-                if self._closing or self._closed or not sources:
+                if self._closing or self._closed or is_stale() or not sources:
                     return
                 new_source = sources[0]
+                if new_source.fingerprint is not None:
+                    self.original_guard.record_fingerprint(new_source.fingerprint)
                 for i in range(self.sources.count()):
                     row_item = self.sources.item(i)
                     row_src = row_item.data(Qt.ItemDataRole.UserRole)
                     if row_src.path.resolve() == target_path and row_src.page is None:
                         row_item.setData(Qt.ItemDataRole.UserRole, new_source)
                         row_item.setIcon(QIcon(pixmap(new_source.thumbnail)))
-                for side, _ in affected_sides:
-                    self._load_source_for_side(side, new_source)
+                for side, expected_card, _, expected_load_gen in affected_sides:
+                    if side_still_matches(side, expected_card, expected_load_gen):
+                        self._load_source_for_side(side, new_source)
                 self.statusBar().showMessage(f"Файл перезагружен: {target_path.name}")
 
-            self.submit(work, done)
+            def failed(message: str):
+                if not (self._closing or self._closed) and not is_stale():
+                    self.show_error(message)
+
+            self.submit(work, done, failed)
         else:
-            for i in range(self.sources.count() - 1, -1, -1):
-                if (
-                    self.sources.item(i).data(Qt.ItemDataRole.UserRole).path.resolve()
-                    == target_path
-                ):
-                    self.sources.takeItem(i)
             self.import_generation += 1
 
             def on_pdf_source(reloaded_src: Source):
-                for side, expected_page in affected_sides:
-                    if reloaded_src.page == expected_page:
+                if is_stale():
+                    return
+                for side, expected_card, expected_page, expected_load_gen in affected_sides:
+                    if reloaded_src.page == expected_page and side_still_matches(
+                        side, expected_card, expected_load_gen
+                    ):
                         self._load_source_for_side(side, reloaded_src)
 
             self._import_pdf_batched(
-                target_path, self.import_generation, on_source_loaded=on_pdf_source
+                target_path,
+                self.import_generation,
+                replace_existing=True,
+                is_stale=is_stale,
+                on_source_loaded=on_pdf_source,
             )
 
     def assign_next(self, _item=None):
@@ -652,12 +692,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Сначала выберите файл или страницу слева.")
             return
         source = item.data(Qt.ItemDataRole.UserRole)
-        if source.fingerprint is not None:
-            try:
-                self.original_guard.validate_source(source.path, expected=source.fingerprint)
-            except SourceChangedError as exc:
-                self.show_error(str(exc))
-                return
         self._load_source_for_side(side, source)
 
     def _load_source_for_side(self, side: str, source: Source):
@@ -727,18 +761,32 @@ class MainWindow(QMainWindow):
 
                 self.submit(image_work, finish_load, fail_load)
 
-            self.submit_pdf(
-                RenderPageRequest(
-                    str(source.path),
-                    source.page,
-                    dpi=PDF_DPI,
-                    session_id=self.session_id,
-                    revision=token,
-                ),
-                on_pdf_rendered,
-                fail_load,
-                coalesce_key=("load_side", side),
-            )
+            def dispatch_pdf_render():
+                if self._closing or self._closed or token != self.load_generation[side]:
+                    return
+                self.submit_pdf(
+                    RenderPageRequest(
+                        str(source.path),
+                        source.page,
+                        dpi=PDF_DPI,
+                        session_id=self.session_id,
+                        revision=token,
+                    ),
+                    on_pdf_rendered,
+                    fail_load,
+                    coalesce_key=("load_side", side),
+                )
+
+            if source.fingerprint is not None:
+                self.submit(
+                    lambda: self.original_guard.validate_source(
+                        source.path, expected=source.fingerprint
+                    ),
+                    lambda _res: dispatch_pdf_render(),
+                    fail_load,
+                )
+            else:
+                dispatch_pdf_render()
 
     def remove_source(self):
         row = self.sources.currentRow()
@@ -1122,22 +1170,34 @@ class MainWindow(QMainWindow):
     def undo(self):
         if self._closing or self._closed:
             return
+        before_mem = self.history.evicted_for_memory_count
         step = self.history.undo()
         if step is None:
             return
         snapshot, label = step
         suffix = f": {label}" if label else ""
-        self._restore_snapshot(snapshot, f"Отменено{suffix}.")
+        mem_note = (
+            " Часть истории очищена по лимиту памяти."
+            if self.history.evicted_for_memory_count > before_mem
+            else ""
+        )
+        self._restore_snapshot(snapshot, f"Отменено{suffix}.{mem_note}")
 
     def redo(self):
         if self._closing or self._closed:
             return
+        before_mem = self.history.evicted_for_memory_count
         step = self.history.redo()
         if step is None:
             return
         snapshot, label = step
         suffix = f": {label}" if label else ""
-        self._restore_snapshot(snapshot, f"Повторено{suffix}.")
+        mem_note = (
+            " Часть истории очищена по лимиту памяти."
+            if self.history.evicted_for_memory_count > before_mem
+            else ""
+        )
+        self._restore_snapshot(snapshot, f"Повторено{suffix}.{mem_note}")
 
     def _restore_snapshot(self, snapshot: WorkspaceSnapshot, status_message: str):
         self._clear_draft()
@@ -1420,13 +1480,61 @@ class MainWindow(QMainWindow):
             for card in self.cards.values()
             if card.source.fingerprint is not None
         )
-        for fp in source_fps:
-            try:
+        card_paths = tuple(card.source.path for card in self.cards.values())
+        snap = snapshot_sheet(self.sheet, revisions=revisions, source_fingerprints=source_fps)
+        frozen_sheet = Sheet(dict(snap.images), list(snap.placements))
+        self._save_generation += 1
+        save_gen = self._save_generation
+
+        if not source_fps:
+            return self._prompt_and_export(
+                kind,
+                captured_snapshot=captured_snapshot,
+                snap=snap,
+                frozen_sheet=frozen_sheet,
+                card_paths=card_paths,
+                close_on_success=close_on_success,
+            )
+
+        self._pending_close_after_export = close_on_success
+
+        def validate_sources():
+            for fp in source_fps:
                 self.original_guard.validate_source(fp.path, expected=fp)
-            except SourceChangedError as exc:
-                self._pending_close_after_export = False
-                self.show_error(str(exc))
-                return False
+
+        def on_validated(_):
+            if self._closing or self._closed or save_gen != self._save_generation:
+                return
+            self._prompt_and_export(
+                kind,
+                captured_snapshot=captured_snapshot,
+                snap=snap,
+                frozen_sheet=frozen_sheet,
+                card_paths=card_paths,
+                close_on_success=close_on_success,
+            )
+
+        def on_validate_failed(message: str):
+            if save_gen != self._save_generation:
+                return
+            self._pending_close_after_export = False
+            if not (self._closing or self._closed):
+                self.show_error(message)
+
+        self.statusBar().showMessage("Проверка исходных файлов…")
+        self.submit(validate_sources, on_validated, on_validate_failed)
+        return True
+
+    def _prompt_and_export(
+        self,
+        kind: str,
+        *,
+        captured_snapshot: WorkspaceSnapshot,
+        snap,
+        frozen_sheet: Sheet,
+        card_paths: tuple[Path, ...],
+        close_on_success: bool,
+    ) -> bool:
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить лист A4",
@@ -1441,6 +1549,7 @@ class MainWindow(QMainWindow):
         if target.suffix.lower() != f".{kind}":
             target = target.with_suffix(f".{kind}")
         self.original_guard.register_many(self.original_paths)
+        self.original_guard.register_many(card_paths)
         self.original_guard.register_many(card.source.path for card in self.cards.values())
         try:
             self.original_guard.assert_not_protected(target)
@@ -1460,8 +1569,6 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 self._pending_close_after_export = False
                 return False
-        snap = snapshot_sheet(self.sheet, revisions=revisions, source_fingerprints=source_fps)
-        frozen_sheet = Sheet(dict(snap.images), list(snap.placements))
         self._pending_close_after_export = close_on_success
 
         def done(_):

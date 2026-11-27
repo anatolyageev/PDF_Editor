@@ -131,9 +131,13 @@ Several independent counters, caches, and state fields protect result freshness 
   immediately mark themselves stale when their card revision or assignment changes.
 - `UndoStack` / `_restore_snapshot`: retains up to 50 `WorkspaceSnapshot` entries and
   at most `256 MiB` of history-only `original` pixel buffers (counted once per shared
-  array, excluding derived `cropped`/`rendered`/`display` images). Restoring a state
-  allocates fresh monotonic `_card_revision_seq`, `load_generation`, and
-  `inspector_request_id` tokens and preserves `original_guard` entries.
+  array, excluding derived `cropped`/`rendered`/`display` images), enforcing the byte
+  budget on `push()`, `undo()`, and `redo()`. Restoring a state allocates fresh
+  monotonic `_card_revision_seq`, `load_generation`, and `inspector_request_id` tokens
+  and preserves `original_guard` entries.
+- `_reload_generation` and `_save_generation`: ensure superseded source reloads do
+  not overwrite newer side assignments or in-flight side loads, and obsolete
+  pre-dialog export validations cannot open stale save dialogs.
 
 `invalidate_sheet` clears the ready `Sheet` and disables export. Export becomes
 available only after current processing and successful `arrange` validation.
@@ -160,17 +164,22 @@ which prevents overwriting existing files but does not make the complete file ap
 atomically during copying. An unexpected OS process crash can still leave a
 `.cardprint-*.tmp` staging file behind.
 
-`Source` carries a `SourceFingerprint` recorded at discovery. Reopening a source in
-`load_source`, `assign_selected`, or `export_sheet` revalidates the file on disk and
-blocks processing/export with `SourceChangedError` if it changed or moved until the
-user reloads it explicitly («Перезагрузить выбранный файл»). `MainWindow.save` captures an immutable `ExportSnapshot` (`snapshot_sheet`) and
-`captured_snapshot` (`WorkspaceSnapshot`), recording `last_exported_revisions` and
-`WorkspaceCheckpoints.mark_exported` only upon successful completion. Failed or
-cancelled exports leave dirty state intact, edits made while an export runs leave the
-workspace dirty with the open button relabelled as an earlier export, and
-`MainWindow.closeEvent` prompts before discarding unexported edits (offering cancel,
-discard, or saving PDF when exportable). Zoom, pan, and focus do not affect
-checkpoints, and undoing back to a matching checkpoint clears the dirty indicator.
+`Source` carries a `SourceFingerprint` recorded at discovery (with SHA-256 hashing and
+`OriginalGuard.validate_source` checks during PDF import, source reload, side
+assignment, and export executed on background tasks rather than the GUI thread).
+Reopening a source in `load_source`, PDF assignment, or `export_sheet` revalidates
+the file on disk and blocks processing/export with `SourceChangedError` if it changed
+or moved until the user reloads it explicitly («Перезагрузить выбранный файл»).
+`MainWindow.save` freezes an immutable `ExportSnapshot`, `Sheet`, and `WorkspaceSnapshot`
+before pre-dialog background source validation and modal file/overwrite dialogs so
+concurrent sheet invalidations cannot raise `AttributeError` or mismatch the captured
+revisions, recording `last_exported_revisions` and `WorkspaceCheckpoints.mark_exported`
+only upon successful completion. Failed or cancelled exports leave dirty state intact,
+edits made while an export runs leave the workspace dirty with the open button relabelled
+as an earlier export, and `MainWindow.closeEvent` prompts before discarding unexported
+edits (offering cancel, discard, or saving PDF when exportable). Zoom, pan, and focus do
+not affect checkpoints, and undoing back to a matching checkpoint clears the dirty
+indicator.
 
 ## Extension points
 

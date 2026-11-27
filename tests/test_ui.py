@@ -1,5 +1,6 @@
 import os
 import signal
+import threading
 from dataclasses import dataclass
 
 import numpy as np
@@ -10,6 +11,7 @@ from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
+from cardprint.export import OriginalGuard
 from cardprint.imaging import full_quad
 from cardprint.pdf_worker import PdfWorkerClient
 from cardprint.ui.editor import ImageView
@@ -177,6 +179,7 @@ def test_full_gui_import_assign_edit_preview_export_and_original_guard(
     saved = target.read_bytes()
     monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.No)
     window.save("png")
+    qtbot.waitUntil(lambda: not window.tasks, timeout=20000)
     assert not window.tasks and target.read_bytes() == saved
     # Even removed thumbnails and cleared sides cannot make originals export targets.
     window.sources.setCurrentRow(0)
@@ -187,6 +190,7 @@ def test_full_gui_import_assign_edit_preview_export_and_original_guard(
     wait_ready(qtbot, window)
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **kw: (str(paths[0]), ""))
     window.save("png")
+    qtbot.waitUntil(lambda: not window.tasks, timeout=20000)
     assert "оригинал" in errors[-1]
     assert [p.read_bytes() for p in paths] == originals
     np.testing.assert_array_equal(front_pixels, np.array(synthetic_card))
@@ -636,6 +640,7 @@ def test_gui_blocks_export_and_assign_when_source_changed_until_reload(
 
     # Export is blocked before opening save dialog and records no exported revision.
     window.save("pdf")
+    qtbot.waitUntil(lambda: not window.tasks, timeout=20000)
     assert errors and "изменился" in errors[-1]
     assert not dialogs_opened
     assert "pdf" not in window.last_exported_revisions
@@ -643,6 +648,7 @@ def test_gui_blocks_export_and_assign_when_source_changed_until_reload(
     # Re-assigning using the stale thumbnail is also blocked, preserving current Card.
     prev_card = window.cards["front"]
     window.assign_selected("front")
+    wait_ready(qtbot, window)
     assert "изменился" in errors[-1]
     assert window.cards["front"] is prev_card
 
@@ -703,6 +709,7 @@ def test_gui_protects_symlink_and_hardlink_to_original_without_overwrite_prompt(
             QFileDialog, "getSaveFileName", lambda *args, p=alias, **kw: (str(p), "")
         )
         window.save("png")
+        qtbot.waitUntil(lambda: not window.tasks, timeout=20000)
         assert errors and "оригинал" in errors[-1]
         assert not prompts
     window.close()
@@ -923,6 +930,7 @@ def test_close_guard_cancel_discard_export_and_unavailable_export_button(
     # 3. Choose Save PDF from close dialog, then cancel file dialog -> stays open and dirty.
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kw: ("", ""))
     window.close()
+    controller.drain()
     assert not window._closed and not window._closing
     assert window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
 
@@ -964,6 +972,8 @@ def test_dirty_state_save_failure_edits_during_export_and_undo_to_checkpoint(
     # 1. Failed export keeps dirty state and does not mark exported.
     assert window.save("pdf")
     assert len(controller.pending) == 1
+    controller.complete_at(0)  # source fingerprint validation passes
+    assert len(controller.pending) == 1
     controller.fail_at(0, "Ошибка записи")
     assert errors and "Ошибка записи" in errors[-1]
     assert window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
@@ -972,6 +982,10 @@ def test_dirty_state_save_failure_edits_during_export_and_undo_to_checkpoint(
     # 2. Edits made while export is in flight: export acknowledges only captured snapshot S1.
     s1 = window.current_workspace_snapshot()
     assert window.save("pdf")
+    assert len(controller.pending) == 1
+    controller.complete_at(
+        0
+    )  # source fingerprint validation passes -> opens dialog & queues export
     assert len(controller.pending) == 1
     window.radius.setValue(5)
     controller.complete_at(0)  # Complete export of S1 while radius=5 render is still pending
@@ -995,3 +1009,181 @@ def test_dirty_state_save_failure_edits_during_export_and_undo_to_checkpoint(
     # 4. Closing clean window does not invoke close prompt.
     window.close()
     assert window._closed
+
+
+def test_stale_reload_does_not_overwrite_newer_side_assignment(qtbot, tmp_path, synthetic_card):
+    path_a = tmp_path / "a.png"
+    path_b = tmp_path / "b.png"
+    synthetic_card.save(path_a)
+    Image.new("RGB", (400, 260), (20, 120, 70)).save(path_b)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    controller = ManualTaskController(window)
+    window.show()
+    window.import_paths([path_a, path_b])
+    controller.drain()
+
+    # Assign A to front.
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    controller.drain()
+    assert window.cards["front"].source.path == path_a.resolve()
+
+    # Start reloading A (pending task 0), then replace front with B before reload A completes.
+    window.sources.setCurrentRow(0)
+    window.reload_selected_source()
+    assert len(controller.pending) == 1  # reload A
+
+    window.sources.setCurrentRow(1)
+    window.assign_selected("front")
+    # Complete B's load + render while reload A is still at index 0.
+    controller.complete_at(1)  # load B
+    controller.complete_at(1)  # render B
+    window.layout_timer.stop()
+    window.refresh_sheet()
+    assert window.cards["front"].source.path == path_b.resolve()
+    card_b = window.cards["front"]
+
+    # Completing stale reload A must update A's thumbnail only, never overwrite front back to A.
+    controller.complete_at(0)
+    controller.drain()
+    assert window.cards["front"] is card_b
+    assert window.cards["front"].source.path == path_b.resolve()
+
+    # Also ignore stale reload A when B's new load is currently in flight (pending_loads).
+    window.sources.setCurrentRow(0)
+    window.reload_selected_source()
+    controller.drain()  # finish clean state
+    # Re-assign A so A is active again.
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    controller.drain()
+    window.sources.setCurrentRow(0)
+    window.reload_selected_source()  # pending[0] = reload A
+    window.sources.setCurrentRow(1)
+    window.assign_selected("front")  # pending[1] = load B (front in pending_loads)
+    assert "front" in window.pending_loads
+    controller.complete_at(0)  # reload A finishes while B is still loading -> must NOT queue load A
+    assert len(controller.pending) == 1  # only B's load remains
+    controller.drain()
+    assert window.cards["front"].source.path == path_b.resolve()
+    window.close()
+
+
+def test_save_survives_sheet_invalidation_during_file_dialog(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    s1 = window.current_workspace_snapshot()
+    rev1 = window.cards["front"].revision
+    out_pdf = tmp_path / "sheet.pdf"
+
+    # Start autodetect so a background task is ready to invalidate window.sheet during save dialog.
+    window.autodetect()
+    assert len(controller.pending) == 1  # pending[0] = autodetect
+
+    def dialog_triggering_invalidation(*_args, **_kwargs):
+        # Complete autodetect while modal file dialog is open; render_card sets window.sheet = None.
+        controller.complete_at(0)
+        assert window.sheet is None
+        return (str(out_pdf), "")
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", dialog_triggering_invalidation)
+    assert window.save("pdf")
+    # pending[0] is autodetect, pending[1] is save's pre-dialog source validation.
+    controller.complete_at(
+        1
+    )  # validates sources -> opens dialog -> invalidates sheet -> queues export
+    controller.drain()
+
+    assert out_pdf.exists()
+    assert window.checkpoints.exports["pdf"].snapshot == s1
+    assert window.last_exported_revisions["pdf"] == (("front", rev1),)
+    window.close()
+
+
+def test_source_hashing_and_validation_never_run_on_gui_thread(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    import cardprint.imaging as imaging_mod
+    import cardprint.ui.window as window_mod
+
+    gui_thread = threading.current_thread()
+    fingerprint_threads: list[threading.Thread] = []
+    validate_threads: list[threading.Thread] = []
+
+    orig_window_fp = window_mod.fingerprint_file
+    orig_imaging_fp = imaging_mod.fingerprint_file
+    orig_validate = OriginalGuard.validate_source
+
+    def tracked_window_fp(path):
+        fingerprint_threads.append(threading.current_thread())
+        return orig_window_fp(path)
+
+    def tracked_imaging_fp(path):
+        fingerprint_threads.append(threading.current_thread())
+        return orig_imaging_fp(path)
+
+    def tracked_validate(self, path, *, expected=None):
+        validate_threads.append(threading.current_thread())
+        return orig_validate(self, path, expected=expected)
+
+    monkeypatch.setattr(window_mod, "fingerprint_file", tracked_window_fp)
+    monkeypatch.setattr(imaging_mod, "fingerprint_file", tracked_imaging_fp)
+    monkeypatch.setattr(OriginalGuard, "validate_source", tracked_validate)
+
+    photo_path = tmp_path / "photo.png"
+    pdf_path = tmp_path / "doc.pdf"
+    synthetic_card.save(photo_path)
+    _make_multipage_pdf(pdf_path, pages=2)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    # Photo import, assign, reload
+    window.import_paths([photo_path])
+    qtbot.waitUntil(lambda: window.sources.count() == 1 and not window.tasks, timeout=20000)
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    wait_ready(qtbot, window)
+    window.reload_selected_source()
+    wait_ready(qtbot, window)
+
+    # PDF import, assign, reload
+    window.import_paths([pdf_path])
+    qtbot.waitUntil(lambda: window.sources.count() == 3 and not window.tasks, timeout=20000)
+    window.sources.setCurrentRow(1)
+    window.assign_selected("back")
+    wait_ready(qtbot, window)
+    window.reload_selected_source()
+    wait_ready(qtbot, window)
+
+    # Save PDF
+    out_pdf = tmp_path / "out.pdf"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, p=out_pdf, **kw: (str(p), ""))
+    assert window.save("pdf")
+    qtbot.waitUntil(lambda: out_pdf.exists() and not window.tasks, timeout=20000)
+
+    assert len(fingerprint_threads) >= 4
+    assert len(validate_threads) >= 4
+    assert all(thread is not gui_thread for thread in fingerprint_threads)
+    assert all(thread is not gui_thread for thread in validate_threads)
+
+    window.close()
+    qtbot.waitUntil(lambda: window._closed, timeout=10000)
+
+
+def test_undo_memory_budget_eviction_updates_status_and_controls(qtbot, tmp_path, synthetic_card):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+    window.history.max_bytes = 100
+    window.undo()
+    controller.drain()
+
+    assert window.history.history_only_bytes <= 100
+    assert not window.history.can_redo
+    assert not window.redo_button.isEnabled()
+    assert window.history.evicted_for_memory_count >= 1
+    assert "памяти" in window.statusBar().currentMessage().lower()
+    window.close()
