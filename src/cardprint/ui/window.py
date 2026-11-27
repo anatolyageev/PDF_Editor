@@ -1,10 +1,11 @@
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QSize, Qt, QThreadPool, QTimer, QUrl
+from PySide6.QtCore import QSettings, QSize, Qt, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -62,7 +63,18 @@ from ..pdf_worker import (
     ThumbnailBatchResult,
 )
 from .editor import CORNER_LABELS, ImageView, pixmap, to_qimage
+from .icons import render_svg_icon
 from .tasks import PdfTaskBridge, Task, dispatch_pdf_request
+from .theme import (
+    THEME_DARK,
+    THEME_LIGHT,
+    ThemePalette,
+    apply_theme,
+    get_palette,
+    load_saved_theme,
+    save_theme,
+    set_widget_property,
+)
 
 BASE_WINDOW_TITLE = "Карточки на A4 · локальная подготовка к печати"
 
@@ -92,15 +104,20 @@ class InspectorDialog(QDialog):
         layout = QVBoxLayout(self)
         self.status_label = QLabel(f"Актуальный снимок · {SIDE_NAMES[side]} (правка #{revision}).")
         self.status_label.setWordWrap(True)
+        set_widget_property(self.status_label, "status", "ok")
         layout.addWidget(self.status_label)
         view = ImageView()
+        if hasattr(parent, "theme_palette"):
+            view.set_canvas_color(parent.theme_palette.canvas_bg)
         view.set_image(image)
+        self.view = view
         layout.addWidget(view)
         layout.addLayout(view_toolbar_builder(view))
         layout.addWidget(
             parent.button(
                 "1 пиксель изображения = 1 пиксель просмотра",
                 lambda: view.zoom(1 / view.transform().m11()),
+                variant="secondary",
             )
         )
         layout.addWidget(
@@ -127,7 +144,7 @@ class InspectorDialog(QDialog):
             f"Проверка краёв · {SIDE_NAMES[self.side]} · устарел (правка #{self.revision})"
         )
         self.status_label.setText(f"⚠ {reason}")
-        self.status_label.setStyleSheet("color: #a34c00; font-weight: 600;")
+        set_widget_property(self.status_label, "status", "warning")
 
     def closeEvent(self, event):
         self._notify_closed()
@@ -141,10 +158,17 @@ def thumbnail(image, limit=2000):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, pdf_worker: PdfWorkerClient | None = None):
+    def __init__(
+        self, pdf_worker: PdfWorkerClient | None = None, *, settings: QSettings | None = None
+    ):
         super().__init__()
+        self._settings = settings
+        self.theme_name = load_saved_theme(self._settings)
+        self.theme_palette: ThemePalette = get_palette(self.theme_name)
+        self._themed_buttons: list[tuple[QPushButton, str, str]] = []
         self.setWindowTitle(BASE_WINDOW_TITLE)
-        self.resize(1380, 880)
+        self.setMinimumSize(960, 620)
+        self.resize(1360, 860)
         self.cards: dict[str, Card] = {}
         self.active_side = "front"
         self.sheet = None
@@ -183,7 +207,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Добавьте изображения или PDF. Все документы обрабатываются на этом компьютере."
         )
+        self.apply_theme(self.theme_name, persist=False)
         self._sync_controls()
+        self._sync_context_panels()
         self._sync_history_controls()
         self._sync_dirty_ui()
         self.invalidate_sheet("Назначьте стороны документа.")
@@ -193,19 +219,67 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
+        outer.setContentsMargins(10, 10, 10, 8)
+        outer.setSpacing(8)
         toolbar = QHBoxLayout()
-        self.add_button = self.button("Добавить файлы", self.add_files)
+        toolbar.setSpacing(6)
+        self.add_button = self._button(
+            "Добавить файлы",
+            self.add_files,
+            variant="secondary",
+            icon_name="add_files",
+            tooltip="Добавить изображения или PDF с этого компьютера",
+        )
         toolbar.addWidget(self.add_button)
-        self.undo_button = self.button("Отменить", self.undo)
-        self.redo_button = self.button("Повторить", self.redo)
+        self.undo_button = self._button(
+            "Отменить",
+            self.undo,
+            variant="ghost",
+            icon_name="undo",
+            tooltip="Отменить последнее действие (Ctrl+Z)",
+        )
+        self.redo_button = self._button(
+            "Повторить",
+            self.redo,
+            variant="ghost",
+            icon_name="redo",
+            tooltip="Повторить отменённое действие (Ctrl+Y / Ctrl+Shift+Z)",
+        )
         toolbar.addWidget(self.undo_button)
         toolbar.addWidget(self.redo_button)
         toolbar.addStretch()
-        toolbar.addWidget(self.button("Предпросмотр", lambda: self.tabs.setCurrentIndex(1)))
-        self.pdf_button = self.button("Сохранить PDF", lambda: self.save("pdf"))
-        self.png_button = self.button("PNG · 300 DPI", lambda: self.save("png"))
-        toolbar.addWidget(self.pdf_button)
+        self.preview_nav_button = self._button(
+            "Предпросмотр",
+            lambda: self.tabs.setCurrentIndex(1),
+            variant="ghost",
+            icon_name="preview",
+            tooltip="Перейти на вкладку «Предпросмотр A4»",
+        )
+        toolbar.addWidget(self.preview_nav_button)
+        self.theme_button = self._button(
+            "Тёмная тема",
+            self.toggle_theme,
+            variant="ghost",
+            icon_name="theme_dark",
+            tooltip="Переключить светлую и тёмную тему оформления",
+        )
+        toolbar.addWidget(self.theme_button)
+        self.png_button = self._button(
+            "PNG · 300 DPI",
+            lambda: self.save("png"),
+            variant="secondary",
+            icon_name="save_png",
+            tooltip="Сохранить лист A4 как растровое изображение PNG 300 DPI",
+        )
+        self.pdf_button = self._button(
+            "Сохранить PDF",
+            lambda: self.save("pdf"),
+            variant="primary",
+            icon_name="save_pdf",
+            tooltip="Сохранить готовый лист A4 в PDF без пересжатия карточек",
+        )
         toolbar.addWidget(self.png_button)
+        toolbar.addWidget(self.pdf_button)
         outer.addLayout(toolbar)
         self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
         self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
@@ -213,12 +287,18 @@ class MainWindow(QMainWindow):
             QKeySequence("Ctrl+Shift+Z"), self, activated=self.redo
         )
         splitter = QSplitter()
+        self.splitter = splitter
         outer.addWidget(splitter, 1)
 
         left = QWidget()
+        left.setMinimumWidth(205)
         left_layout = QVBoxLayout(left)
-        left_layout.addWidget(QLabel("Файлы и страницы PDF"))
+        left_layout.setContentsMargins(0, 0, 4, 0)
+        left_title = QLabel("Файлы и страницы PDF")
+        set_widget_property(left_title, "role", "sectionTitle")
+        left_layout.addWidget(left_title)
         self.sources = QListWidget()
+        self.sources.setAccessibleName("Список загруженных файлов и страниц PDF")
         self.sources.setIconSize(QSize(144, 108))
         self.sources.setViewMode(QListView.ViewMode.IconMode)
         self.sources.setResizeMode(QListView.ResizeMode.Adjust)
@@ -231,79 +311,130 @@ class MainWindow(QMainWindow):
             "Выберите миниатюру и назначьте сторону.\nДвойной щелчок заполняет следующую сторону."
         )
         label.setWordWrap(True)
+        set_widget_property(label, "status", "muted")
         left_layout.addWidget(label)
         left_layout.addWidget(
-            self.button("Назначить лицевой", lambda: self.assign_selected("front"))
+            self._button(
+                "Назначить лицевой",
+                lambda: self.assign_selected("front"),
+                variant="secondary",
+                icon_name="assign_front",
+                tooltip="Назначить выбранную миниатюру лицевой стороной",
+            )
         )
         left_layout.addWidget(
-            self.button("Назначить обратной", lambda: self.assign_selected("back"))
+            self._button(
+                "Назначить обратной",
+                lambda: self.assign_selected("back"),
+                variant="secondary",
+                icon_name="assign_back",
+                tooltip="Назначить выбранную миниатюру обратной стороной",
+            )
         )
-        left_layout.addWidget(self.button("Убрать выбранный файл", self.remove_source))
-        self.reload_source_button = self.button(
-            "Перезагрузить выбранный файл", self.reload_selected_source
+        self.reload_source_button = self._button(
+            "Перезагрузить выбранный файл",
+            self.reload_selected_source,
+            variant="secondary",
+            icon_name="reload",
+            tooltip="Повторно прочитать выбранный файл с диска",
         )
         left_layout.addWidget(self.reload_source_button)
+        left_layout.addWidget(
+            self._button(
+                "Убрать выбранный файл",
+                self.remove_source,
+                variant="danger",
+                icon_name="remove",
+                tooltip="Убрать миниатюру из списка (исходный файл на диске сохраняется)",
+            )
+        )
         splitter.addWidget(left)
 
         self.tabs = QTabWidget()
+        self.tabs.setAccessibleName("Режимы редактирования и предпросмотра")
         edit_tab = QWidget()
         edit_layout = QVBoxLayout(edit_tab)
         side_row = QHBoxLayout()
         self.side_combo = QComboBox()
+        self.side_combo.setAccessibleName("Выбор редактируемой стороны")
         for side, name in SIDE_NAMES.items():
             self.side_combo.addItem(name, side)
         self.side_combo.currentIndexChanged.connect(self.change_side)
-        side_row.addWidget(self.side_combo)
-        side_row.addWidget(self.button("Убрать сторону", self.remove_side))
+        side_row.addWidget(self.side_combo, 1)
+        side_row.addWidget(
+            self._button(
+                "Убрать сторону",
+                self.remove_side,
+                variant="danger",
+                icon_name="remove",
+                tooltip="Очистить назначение текущей стороны",
+            )
+        )
         edit_layout.addLayout(side_row)
         self.source_label = QLabel("Сторона не назначена")
         self.source_label.setWordWrap(True)
+        set_widget_property(self.source_label, "status", "muted")
         edit_layout.addWidget(self.source_label)
         self.editor = ImageView(editable=True)
+        self.editor.setAccessibleName("Редактор границ выбранной стороны")
         self.editor.selectionChanged.connect(self.selection_changed)
         self.editor.draftChanged.connect(self.on_draft_changed)
         self.editor.draftCancelled.connect(self.on_draft_cancelled)
         edit_layout.addWidget(self.editor, 1)
         self.editor_actions = []
-        for names in (
-            (("Определить границы", self.autodetect), ("Сбросить выделение", self.reset_selection)),
-            (("Выделить 4 точки", self.pick_points), ("Повернуть на 90°", self.rotate)),
-        ):
+        action_specs = (
+            (
+                ("Определить границы", self.autodetect, "secondary", "autodetect"),
+                ("Сбросить выделение", self.reset_selection, "danger", "reset"),
+            ),
+            (
+                ("Выделить 4 точки", self.pick_points, "secondary", "pick_points"),
+                ("Повернуть на 90°", self.rotate, "secondary", "rotate"),
+            ),
+        )
+        for pairs in action_specs:
             row = QHBoxLayout()
-            for title, callback in names:
-                button = self.button(title, callback)
-                row.addWidget(button)
-                self.editor_actions.append(button)
+            for title, callback, variant, icon_name in pairs:
+                btn = self._button(title, callback, variant=variant, icon_name=icon_name)
+                row.addWidget(btn)
+                self.editor_actions.append(btn)
             edit_layout.addLayout(row)
         edit_layout.addLayout(self.view_toolbar(self.editor))
         hint = QLabel(
             "Колесо — масштаб; фон — перемещение. Углы: 1 ↖ → 2 ↗ → 3 ↘ → 4 ↙.\nПосле выделения четырёх точек можно перетаскивать каждый угол; Esc отменяет ввод точек."
         )
         hint.setWordWrap(True)
+        set_widget_property(hint, "status", "muted")
         edit_layout.addWidget(hint)
         self.tabs.addTab(edit_tab, "Редактор стороны")
 
         preview_tab = QWidget()
         preview_layout = QVBoxLayout(preview_tab)
         self.preview = ImageView()
+        self.preview.setAccessibleName("Предпросмотр листа A4")
         preview_layout.addWidget(self.preview, 1)
         preview_layout.addLayout(self.view_toolbar(self.preview))
-        preview_layout.addWidget(QLabel("A4 · 210 × 297 мм · белый фон RGB 255, 255, 255"))
+        preview_note = QLabel("A4 · 210 × 297 мм · белый фон RGB 255, 255, 255")
+        set_widget_property(preview_note, "status", "muted")
+        preview_layout.addWidget(preview_note)
         self.tabs.addTab(preview_tab, "Предпросмотр A4")
+        self.tabs.currentChanged.connect(self._sync_context_panels)
         splitter.addWidget(self.tabs)
 
         controls = QWidget()
         controls_layout = QVBoxLayout(controls)
-        card_group = QGroupBox("Размер выбранной стороны")
-        form = QFormLayout(card_group)
+        controls_layout.setContentsMargins(4, 0, 2, 0)
+        self.card_group = QGroupBox("Размер выбранной стороны")
+        form = QFormLayout(self.card_group)
         self.size_mode = QComboBox()
+        self.size_mode.setAccessibleName("Режим физического размера карточки")
         self.size_mode.addItem("Удостоверение · 85,60 × 53,98 мм", "id1")
         self.size_mode.addItem("Исходные пропорции + ширина", "aspect")
         self.size_mode.addItem("Произвольный размер", "custom")
         form.addRow(self.size_mode)
-        self.width = self.spin(1, 400, 85.6)
-        self.height = self.spin(1, 400, 53.98)
-        self.radius = self.spin(0, 20, 0)
+        self.width = self.spin(1, 400, 85.6, accessible_name="Ширина карточки в миллиметрах")
+        self.height = self.spin(1, 400, 53.98, accessible_name="Высота карточки в миллиметрах")
+        self.radius = self.spin(0, 20, 0, accessible_name="Радиус скругления углов в миллиметрах")
         form.addRow("Ширина", self.width)
         form.addRow("Высота", self.height)
         form.addRow("Радиус углов", self.radius)
@@ -312,47 +443,81 @@ class MainWindow(QMainWindow):
         form.addRow(self.ratio_label)
         self.resolution_label = QLabel()
         self.resolution_label.setWordWrap(True)
+        set_widget_property(self.resolution_label, "status", "muted")
         form.addRow(self.resolution_label)
-        self.inspect_button = self.button("Увеличить результат / края", self.inspect_card)
+        self.inspect_button = self._button(
+            "Увеличить результат / края",
+            self.inspect_card,
+            variant="secondary",
+            icon_name="inspect",
+            tooltip="Открыть крупный снимок вырезанной карточки для проверки краёв",
+        )
         form.addRow(self.inspect_button)
-        self.reset_button = self.button("Сбросить правки стороны", self.reset_card)
+        self.reset_button = self._button(
+            "Сбросить правки стороны",
+            self.reset_card,
+            variant="danger",
+            icon_name="reset",
+            tooltip="Сбросить углы, поворот, размер и скругление текущей стороны",
+        )
         form.addRow(self.reset_button)
-        controls_layout.addWidget(card_group)
-        layout_group = QGroupBox("Компоновка A4")
-        form = QFormLayout(layout_group)
+        controls_layout.addWidget(self.card_group)
+
+        self.layout_group = QGroupBox("Компоновка A4")
+        form = QFormLayout(self.layout_group)
         self.template = QComboBox()
+        self.template.setAccessibleName("Шаблон расположения карточек на A4")
         self.template.addItem("Друг под другом", "vertical")
         self.template.addItem("Рядом", "horizontal")
         form.addRow("Шаблон", self.template)
-        self.gap = self.spin(0, 150, 15)
-        self.margin = self.spin(0, 100, 10)
-        self.offset_x = self.spin(-200, 200, 0)
-        self.offset_y = self.spin(-290, 290, 0)
+        self.gap = self.spin(
+            0, 150, 15, accessible_name="Промежуток между карточками в миллиметрах"
+        )
+        self.margin = self.spin(0, 100, 10, accessible_name="Минимальные поля листа в миллиметрах")
+        self.offset_x = self.spin(
+            -200, 200, 0, accessible_name="Смещение по горизонтали X в миллиметрах"
+        )
+        self.offset_y = self.spin(
+            -290, 290, 0, accessible_name="Смещение по вертикали Y в миллиметрах"
+        )
         form.addRow("Промежуток", self.gap)
         form.addRow("Минимальные поля", self.margin)
         form.addRow("Смещение X →", self.offset_x)
         form.addRow("Смещение Y ↓", self.offset_y)
         note = QLabel("Группа карточек центрируется на листе. Смещения отсчитываются от центра.")
         note.setWordWrap(True)
+        set_widget_property(note, "status", "muted")
         form.addRow(note)
-        controls_layout.addWidget(layout_group)
+        controls_layout.addWidget(self.layout_group)
+
+        self.status_group = QGroupBox("Статус и экспорт")
+        status_layout = QVBoxLayout(self.status_group)
         self.layout_message = QLabel("Назначьте стороны документа.")
         self.layout_message.setWordWrap(True)
-        controls_layout.addWidget(self.layout_message)
+        status_layout.addWidget(self.layout_message)
         self.export_message = QLabel(PRINT_HINT)
         self.export_message.setWordWrap(True)
-        controls_layout.addWidget(self.export_message)
-        self.open_button = self.button("Открыть сохранённый файл", self.open_export)
+        set_widget_property(self.export_message, "status", "muted")
+        status_layout.addWidget(self.export_message)
+        self.open_button = self._button(
+            "Открыть сохранённый файл",
+            self.open_export,
+            variant="secondary",
+            icon_name="open_external",
+            tooltip="Открыть последний экспортированный PDF или PNG",
+        )
         self.open_button.hide()
         self.export_path = None
-        controls_layout.addWidget(self.open_button)
+        status_layout.addWidget(self.open_button)
+        controls_layout.addWidget(self.status_group)
+
         controls_layout.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(controls)
-        scroll.setMinimumWidth(310)
+        scroll.setMinimumWidth(290)
         splitter.addWidget(scroll)
-        splitter.setSizes([230, 790, 360])
+        splitter.setSizes([230, 720, 330])
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setMaximumHeight(5)
@@ -365,28 +530,141 @@ class MainWindow(QMainWindow):
         for spin in (self.gap, self.margin, self.offset_x, self.offset_y):
             spin.valueChanged.connect(self.layout_options_changed)
 
+    def _button(
+        self,
+        title: str,
+        callback,
+        *,
+        variant: str = "secondary",
+        icon_name: str | None = None,
+        tooltip: str | None = None,
+        accessible_name: str | None = None,
+    ) -> QPushButton:
+        btn = self.button(
+            title,
+            callback,
+            variant=variant,
+            tooltip=tooltip,
+            accessible_name=accessible_name,
+        )
+        if icon_name is not None:
+            self._themed_buttons.append((btn, icon_name, variant))
+        return btn
+
     @staticmethod
-    def button(title, callback):
+    def button(
+        title,
+        callback,
+        *,
+        variant: str = "secondary",
+        tooltip: str | None = None,
+        accessible_name: str | None = None,
+    ):
         button = QPushButton(title)
+        set_widget_property(button, "variant", variant)
+        button.setAccessibleName(accessible_name or title)
+        if tooltip:
+            button.setToolTip(tooltip)
         button.clicked.connect(callback)
         return button
 
     @staticmethod
-    def spin(minimum, maximum, value):
+    def spin(minimum, maximum, value, *, accessible_name: str | None = None):
         spin = QDoubleSpinBox()
         spin.setRange(minimum, maximum)
         spin.setDecimals(2)
         spin.setSuffix(" мм")
         spin.setValue(value)
         spin.setKeyboardTracking(False)
+        if accessible_name:
+            spin.setAccessibleName(accessible_name)
         return spin
 
     def view_toolbar(self, view):
         row = QHBoxLayout()
-        row.addWidget(self.button("−", lambda: view.zoom(1 / 1.25)))
-        row.addWidget(self.button("Вписать", view.fit_image))
-        row.addWidget(self.button("+", lambda: view.zoom(1.25)))
+        row.addWidget(
+            self._button(
+                "−",
+                lambda: view.zoom(1 / 1.25),
+                variant="ghost",
+                icon_name="zoom_out",
+                tooltip="Уменьшить масштаб просмотра",
+                accessible_name="Уменьшить масштаб",
+            )
+        )
+        row.addWidget(
+            self._button(
+                "Вписать",
+                view.fit_image,
+                variant="ghost",
+                icon_name="fit",
+                tooltip="Вписать изображение целиком в область просмотра",
+            )
+        )
+        row.addWidget(
+            self._button(
+                "+",
+                lambda: view.zoom(1.25),
+                variant="ghost",
+                icon_name="zoom_in",
+                tooltip="Увеличить масштаб просмотра",
+                accessible_name="Увеличить масштаб",
+            )
+        )
         return row
+
+    def _icon_color_for_variant(self, palette: ThemePalette, variant: str) -> str:
+        if variant == "primary":
+            return palette.accent_text
+        if variant == "danger":
+            return palette.danger
+        return palette.text_primary
+
+    def _refresh_theme_icons(self) -> None:
+        palette = self.theme_palette
+        for button, icon_name, variant in self._themed_buttons:
+            actual_icon = icon_name
+            if button is self.theme_button:
+                actual_icon = "theme_light" if self.theme_name == THEME_DARK else "theme_dark"
+            color = self._icon_color_for_variant(palette, variant)
+            button.setIcon(render_svg_icon(actual_icon, color, size=18))
+            button.setIconSize(QSize(18, 18))
+
+    def _sync_context_panels(self, tab_index: int | None = None) -> None:
+        index = self.tabs.currentIndex() if tab_index is None else tab_index
+        in_preview = index == 1
+        self.card_group.setVisible(not in_preview)
+        self.layout_group.setVisible(in_preview)
+
+    def apply_theme(self, theme_name: str, *, persist: bool = True) -> ThemePalette:
+        palette = get_palette(theme_name)
+        self.theme_name = palette.name
+        self.theme_palette = palette
+        app = QApplication.instance()
+        apply_theme(app if app is not None else self, palette.name)
+        self.editor.set_canvas_color(palette.canvas_bg)
+        self.editor.set_accent_color(palette.accent)
+        self.preview.set_canvas_color(palette.canvas_bg)
+        for inspector in list(self.inspectors):
+            inspector.view.set_canvas_color(palette.canvas_bg)
+        if self.active_side not in self.cards:
+            self.editor.set_image(Image.new("RGB", (700, 440), palette.panel_bg))
+        if palette.name == THEME_DARK:
+            self.theme_button.setText("Светлая тема")
+            self.theme_button.setAccessibleName("Переключить на светлую тему")
+            self.theme_button.setToolTip("Переключить на светлую тему оформления")
+        else:
+            self.theme_button.setText("Тёмная тема")
+            self.theme_button.setAccessibleName("Переключить на тёмную тему")
+            self.theme_button.setToolTip("Переключить на тёмную тему оформления")
+        self._refresh_theme_icons()
+        if persist:
+            save_theme(palette.name, self._settings)
+        return palette
+
+    def toggle_theme(self) -> str:
+        next_theme = THEME_LIGHT if self.theme_name == THEME_DARK else THEME_DARK
+        return self.apply_theme(next_theme, persist=True).name
 
     def submit(self, function, success, error=None):
         if self._closing or self._closed:
@@ -867,7 +1145,7 @@ class MainWindow(QMainWindow):
             self.editor.set_image(card.display, card.source_size, card.points)
             self.source_label.setText(card.source.label)
         else:
-            self.editor.set_image(Image.new("RGB", (700, 440), "#edf1f5"))
+            self.editor.set_image(Image.new("RGB", (700, 440), self.theme_palette.panel_bg))
             self.source_label.setText("Сторона не назначена. Выберите миниатюру слева.")
         self._sync_controls()
 
@@ -913,10 +1191,10 @@ class MainWindow(QMainWindow):
             self.ratio_label.setText(
                 f"⚠ Размер изменяет пропорции выделения на {deviation:+.1%}. Для сохранения выберите «Исходные пропорции»."
             )
-            self.ratio_label.setStyleSheet("color: #a34c00")
+            set_widget_property(self.ratio_label, "status", "warning")
         else:
-            self.ratio_label.setText("Пропорции выделения сохранены (отклонение ≤ 0,5%).")
-            self.ratio_label.setStyleSheet("")
+            self.ratio_label.setText("✓ Пропорции выделения сохранены (отклонение ≤ 0,5%).")
+            set_widget_property(self.ratio_label, "status", "ok")
         dpi = min(w / mm_w, h / mm_h) * 25.4
         self.resolution_label.setText(
             f"После перспективы: {w} × {h} пикс.\nПри печати: ≈ {dpi:.0f} DPI.\nУвеличение размера не добавляет деталей."
@@ -928,7 +1206,7 @@ class MainWindow(QMainWindow):
         self.pdf_button.setEnabled(False)
         self.png_button.setEnabled(False)
         self.layout_message.setText(message)
-        self.layout_message.setStyleSheet("")
+        set_widget_property(self.layout_message, "status", "")
         self.preview.setEnabled(False)
         self.tabs.setTabText(1, "Предпросмотр A4 · обновление")
 
@@ -1112,8 +1390,8 @@ class MainWindow(QMainWindow):
                     self.invalidate_sheet(self.draft_message or "Редактирование выделения…")
                     self.tabs.setTabText(1, "Предпросмотр A4 · редактирование")
                 else:
-                    self.invalidate_sheet(message)
-                    self.layout_message.setStyleSheet("color: #ad352c")
+                    self.invalidate_sheet(f"✕ {message}")
+                    set_widget_property(self.layout_message, "status", "error")
                     self.tabs.setTabText(1, "Предпросмотр A4 · исправьте выделение")
 
         self.submit(work, done, failed)
@@ -1274,11 +1552,11 @@ class MainWindow(QMainWindow):
             self.layout_message.setText("Загрузка выбранной стороны…")
             return
         errors = [
-            f"{SIDE_NAMES[side]}: {card.error}" for side, card in self.cards.items() if card.error
+            f"✕ {SIDE_NAMES[side]}: {card.error}" for side, card in self.cards.items() if card.error
         ]
         if errors:
             self.layout_message.setText("\n".join(errors))
-            self.layout_message.setStyleSheet("color: #ad352c")
+            set_widget_property(self.layout_message, "status", "error")
             self.tabs.setTabText(1, "Предпросмотр A4 · исправьте выделение")
             return
         if not self.cards:
@@ -1296,8 +1574,8 @@ class MainWindow(QMainWindow):
             placements = arrange(sizes, self.current_layout())
             sheet = Sheet({side: card.rendered for side, card in self.cards.items()}, placements)
         except ValueError as exc:
-            self.layout_message.setText(str(exc))
-            self.layout_message.setStyleSheet("color: #ad352c")
+            self.layout_message.setText(f"✕ {exc}")
+            set_widget_property(self.layout_message, "status", "error")
             self.tabs.setTabText(1, "Предпросмотр A4 · не помещается")
             return
 
@@ -1315,10 +1593,10 @@ class MainWindow(QMainWindow):
             self.pdf_button.setEnabled(True)
             self.png_button.setEnabled(True)
             self.tabs.setTabText(1, "Предпросмотр A4")
-            self.layout_message.setStyleSheet("")
+            set_widget_property(self.layout_message, "status", "ok")
             count = len(sheet.placements)
             self.layout_message.setText(
-                f"На листе: {count} из 2 сторон.\n"
+                f"✓ На листе: {count} из 2 сторон.\n"
                 + "\n".join(
                     f"{SIDE_NAMES[p.side]}: {p.width_mm:.2f} × {p.height_mm:.2f} мм"
                     for p in sheet.placements

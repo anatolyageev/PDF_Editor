@@ -87,8 +87,10 @@ class ImageView(QGraphicsView):
         self._pick_markers = []
         self._dragging_handle: int | None = None
         self._drag_origin_points: tuple[tuple[float, float], ...] | None = None
+        self._accent_color = QColor("#187cce")
         self.auto_fit = True
         self.setBackgroundBrush(QColor("#dbe1e8"))
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
         )
@@ -96,6 +98,21 @@ class ImageView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setMinimumSize(280, 240)
+
+    def set_canvas_color(self, color: str | QColor) -> None:
+        self.setBackgroundBrush(QColor(color))
+
+    def set_accent_color(self, color: str | QColor) -> None:
+        self._accent_color = QColor(color)
+        if self.polygon is not None:
+            pen = QPen(self._accent_color, 2)
+            pen.setCosmetic(True)
+            self.polygon.setPen(pen)
+            fill = QColor(self._accent_color)
+            fill.setAlpha(28)
+            self.polygon.setBrush(fill)
+        for handle in self.handles:
+            handle.setPen(QPen(self._accent_color, 2))
 
     @property
     def is_drafting(self) -> bool:
@@ -140,14 +157,17 @@ class ImageView(QGraphicsView):
         self.handles = []
         if self.polygon is None:
             self.polygon = QGraphicsPolygonItem()
-            pen = QPen(QColor("#1684d8"), 2)
+            pen = QPen(self._accent_color, 2)
             pen.setCosmetic(True)
             self.polygon.setPen(pen)
-            self.polygon.setBrush(QColor(24, 124, 206, 22))
+            fill = QColor(self._accent_color)
+            fill.setAlpha(28)
+            self.polygon.setBrush(fill)
             self.polygon.setZValue(2)
             self.scene().addItem(self.polygon)
         for index, point in enumerate(points):
             handle = Handle(self, index, point)
+            handle.setPen(QPen(self._accent_color, 2))
             self.scene().addItem(handle)
             self.handles.append(handle)
         self.update_polygon()

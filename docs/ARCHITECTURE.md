@@ -18,14 +18,16 @@ entry point calls `cardprint.app:main`. The project uses a `src/` layout and Hat
 
 | File | Responsibility |
 | --- | --- |
-| [app.py](../src/cardprint/app.py) | QApplication, `multiprocessing.freeze_support()`, Russian locale, Fusion style, Wayland selection when its socket is available, and MainWindow startup. |
+| [app.py](../src/cardprint/app.py) | QApplication, `multiprocessing.freeze_support()`, Russian locale, Fusion style, persisted Light/Dark theme startup, Wayland selection when its socket is available, and MainWindow startup. |
 | [pdf_worker.py](../src/cardprint/pdf_worker.py) | Single spawned PyMuPDF child process, serializable IPC requests/results, request coalescing, crash recovery, and byte-bounded `ByteLRUCache` (32 MiB thumbnails / 128 MiB display pages). No Qt dependency. |
 | [imaging.py](../src/cardprint/imaging.py) | Source, import, EXIF, batched PDF discovery via `pdf_worker`, pixel loading, contour detection, rotation, perspective correction, and white rounded corners. No Qt or top-level PyMuPDF dependency. |
 | [geometry.py](../src/cardprint/geometry.py) | ViewTransform, Quad, corner validation, CardSize, Layout, Placement, and arrange. Independent of the UI. |
 | [model.py](../src/cardprint/model.py) | Pure-Python domain models (`Card`, `SIDE_NAMES`), memory-bounded parametric `UndoStack` (`CardSnapshot`, `WorkspaceSnapshot`), and `WorkspaceCheckpoints` (`ExportRecord`). No Qt dependency. |
 | [export.py](../src/cardprint/export.py) | Sheet, ExportSnapshot, OriginalGuard, SourceFingerprint, atomic_write_file, render_sheet, PDF/PNG output, and staged PDF/PNG validation. No Qt dependency. |
-| [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, zoom, and pan. |
-| [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, side assignments, settings, task coordination, and export actions. |
+| [ui/theme.py](../src/cardprint/ui/theme.py) | `ThemePalette` (`light` / `dark`), `QPalette` + QSS stylesheet generation (`variant` button hierarchy, semantic `status` labels, card-style panels), and `QSettings` persistence. |
+| [ui/icons.py](../src/cardprint/ui/icons.py) | Bundled inline monochrome SVG icons rendered and palette-tinted via `QSvgRenderer` at `1×` / `2×` DPI with bounded LRU caching. |
+| [ui/editor.py](../src/cardprint/ui/editor.py) | QGraphicsView-based ImageView, draggable Handle objects, four-point input, draft selection transactions, theme-aware canvas/accent colors, zoom, and pan. |
+| [ui/window.py](../src/cardprint/ui/window.py) | MainWindow, InspectorDialog, side assignments, contextual right panels, theme toggle, task coordination, and export actions. |
 | [ui/tasks.py](../src/cardprint/ui/tasks.py) | `QRunnable` `Task` for pure image work and `PdfTaskBridge` for delivering `PdfWorkerClient` results onto the GUI thread. |
 | [tests/](../tests/) | Geometry, model, worker, processing, export, and Qt integration tests using artificial data. |
 | [scripts/](../scripts/) | Example generation and a GUI smoke test that saves screenshots and exports. |

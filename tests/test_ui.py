@@ -8,13 +8,21 @@ import pymupdf
 import pytest
 from PIL import Image
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
+from PySide6.QtGui import QColor, QImage
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QPushButton
 
 from cardprint.export import OriginalGuard
 from cardprint.imaging import full_quad
 from cardprint.pdf_worker import PdfWorkerClient
 from cardprint.ui.editor import ImageView
+from cardprint.ui.icons import ICONS, render_svg_icon
+from cardprint.ui.theme import (
+    DARK_PALETTE,
+    LIGHT_PALETTE,
+    THEME_DARK,
+    THEME_LIGHT,
+    build_stylesheet,
+)
 from cardprint.ui.window import BASE_WINDOW_TITLE, InspectorDialog, MainWindow
 
 REAL_PROMPT_UNSAVED = MainWindow._prompt_unsaved_changes
@@ -1186,4 +1194,165 @@ def test_undo_memory_budget_eviction_updates_status_and_controls(qtbot, tmp_path
     assert not window.redo_button.isEnabled()
     assert window.history.evicted_for_memory_count >= 1
     assert "памяти" in window.statusBar().currentMessage().lower()
+    window.close()
+
+
+def _contrast_ratio(fg_hex: str, bg_hex: str) -> float:
+    def _lum(hex_color: str) -> float:
+        color = QColor(hex_color)
+        channels = [
+            ch / 12.92 if ch <= 0.03928 else ((ch + 0.055) / 1.055) ** 2.4
+            for ch in (color.redF(), color.greenF(), color.blueF())
+        ]
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+    l1, l2 = _lum(fg_hex), _lum(bg_hex)
+    return (max(l1, l2) + 0.05) / (min(l1, l2) + 0.05)
+
+
+def test_theme_palettes_contrast_and_svg_icons(qtbot):
+    for palette in (LIGHT_PALETTE, DARK_PALETTE):
+        assert palette.canvas_bg.lower() != "#ffffff"
+        assert _contrast_ratio(palette.text_primary, palette.card_bg) >= 4.5
+        assert _contrast_ratio(palette.text_primary, palette.window_bg) >= 4.5
+        assert _contrast_ratio(palette.text_secondary, palette.card_bg) >= 4.5
+        assert _contrast_ratio(palette.text_secondary, palette.window_bg) >= 4.5
+        assert _contrast_ratio(palette.accent_text, palette.accent) >= 4.5
+        assert _contrast_ratio(palette.danger, palette.card_bg) >= 4.5
+        assert _contrast_ratio(palette.warning, palette.card_bg) >= 4.5
+        assert _contrast_ratio(palette.success, palette.card_bg) >= 4.5
+
+        qss = build_stylesheet(palette)
+        for selector in (
+            'QPushButton[variant="primary"]',
+            'QPushButton[variant="secondary"]',
+            'QPushButton[variant="ghost"]',
+            'QPushButton[variant="danger"]',
+            'QLabel[status="error"]',
+            'QLabel[status="warning"]',
+            'QLabel[status="ok"]',
+        ):
+            assert selector in qss
+
+    for icon_name in ICONS:
+        for color in (LIGHT_PALETTE.text_primary, DARK_PALETTE.text_primary):
+            icon = render_svg_icon(icon_name, color, size=18)
+            assert not icon.isNull()
+            img = icon.pixmap(18, 18).toImage()
+            assert any(img.pixelColor(x, y).alpha() > 0 for x in range(18) for y in range(18)), (
+                f"Icon {icon_name} rendered empty for {color}"
+            )
+
+    with pytest.raises(KeyError):
+        render_svg_icon("nonexistent_icon", "#000000")
+
+
+def test_theme_toggle_persists_in_qsettings_keeps_dirty_clean_and_a4_white(
+    qtbot, tmp_path, synthetic_card, monkeypatch
+):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    assert window.theme_name == THEME_LIGHT
+    assert window.theme_button.text() == "Тёмная тема"
+    assert window.preview.backgroundBrush().color().name().lower() == LIGHT_PALETTE.canvas_bg
+    assert not window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
+
+    # Toggle to dark theme: UI updates immediately, QSettings saves, dirty state stays clean.
+    assert window.toggle_theme() == THEME_DARK
+    assert window.theme_button.text() == "Светлая тема"
+    assert window.preview.backgroundBrush().color().name().lower() == DARK_PALETTE.canvas_bg
+    assert window.editor.backgroundBrush().color().name().lower() == DARK_PALETTE.canvas_bg
+    app = QApplication.instance()
+    assert DARK_PALETTE.window_bg in app.styleSheet()
+    assert not window.checkpoints.needs_close_confirmation(window.current_workspace_snapshot())
+
+    # Newly created window restores Dark theme from QSettings.
+    restored = MainWindow()
+    qtbot.addWidget(restored)
+    assert restored.theme_name == THEME_DARK
+    assert restored.theme_button.text() == "Светлая тема"
+    restored.close()
+    qtbot.waitUntil(lambda: restored._closed, timeout=10000)
+
+    # Export PNG under Dark theme: exported A4 background remains strictly white (255, 255, 255).
+    path = tmp_path / "card.png"
+    synthetic_card.save(path)
+    window.import_paths([path])
+    qtbot.waitUntil(lambda: window.sources.count() == 1 and not window.tasks, timeout=20000)
+    window.sources.setCurrentRow(0)
+    window.assign_selected("front")
+    wait_ready(qtbot, window)
+
+    out_png = tmp_path / "dark_mode_sheet.png"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, p=out_png, **kw: (str(p), ""))
+    assert window.save("png")
+    qtbot.waitUntil(lambda: out_png.exists() and not window.tasks, timeout=20000)
+
+    with Image.open(out_png) as exported:
+        assert exported.getpixel((0, 0)) == (255, 255, 255)
+        assert exported.getpixel((exported.width - 1, exported.height - 1)) == (255, 255, 255)
+
+    window.close()
+    qtbot.waitUntil(lambda: window._closed, timeout=10000)
+
+
+def test_button_variants_contextual_panels_accessibility_and_compact_layout(
+    qtbot, tmp_path, synthetic_card
+):
+    window, controller = _setup_front_with_controller(qtbot, tmp_path, synthetic_card)
+
+    # Exactly one primary CTA; secondary, ghost, and danger variants assigned explicitly.
+    primary_buttons = [
+        btn for btn in window.findChildren(QPushButton) if btn.property("variant") == "primary"
+    ]
+    assert primary_buttons == [window.pdf_button]
+    assert window.png_button.property("variant") == "secondary"
+    assert window.add_button.property("variant") == "secondary"
+    assert window.undo_button.property("variant") == "ghost"
+    assert window.redo_button.property("variant") == "ghost"
+    assert window.theme_button.property("variant") == "ghost"
+    assert window.reset_button.property("variant") == "danger"
+
+    # Contextual right panel: side settings on Editor tab, sheet layout on Preview tab.
+    assert window.tabs.currentIndex() == 0
+    assert window.card_group.isVisible()
+    assert not window.layout_group.isVisible()
+    assert window.status_group.isVisible()
+
+    window.tabs.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: window.layout_group.isVisible(), timeout=2000)
+    assert not window.card_group.isVisible()
+    assert window.layout_group.isVisible()
+    assert window.status_group.isVisible()
+    window.tabs.setCurrentIndex(0)
+
+    # Accessibility and focus policy survive Light -> Dark toggle, with non-color status text.
+    assert window.pdf_button.accessibleName()
+    assert window.sources.accessibleName()
+    assert window.editor.focusPolicy() != Qt.FocusPolicy.NoFocus
+    assert window.preview.focusPolicy() != Qt.FocusPolicy.NoFocus
+    assert "✓" in window.layout_message.text()
+
+    window.toggle_theme()
+    assert window.pdf_button.accessibleName()
+    assert window.editor.focusPolicy() != Qt.FocusPolicy.NoFocus
+
+    # Invalid size aspect warns with warning icon/property, not color alone.
+    window.size_mode.setCurrentIndex(window.size_mode.findData("custom"))
+    window.width.setValue(120.0)
+    window.height.setValue(40.0)
+    controller.drain()
+    assert window.ratio_label.property("status") == "warning"
+    assert "⚠" in window.ratio_label.text()
+
+    # Compact 1280x720 desktop viewport keeps all three splitter panes usable.
+    window.resize(1280, 720)
+    QApplication.processEvents()
+    assert window.size().width() <= 1280 and window.size().height() <= 720
+    sizes = window.splitter.sizes()
+    assert len(sizes) == 3 and all(pane > 180 for pane in sizes)
+    assert sum(sizes) <= 1280
+
     window.close()

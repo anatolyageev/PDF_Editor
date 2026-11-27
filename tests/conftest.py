@@ -20,6 +20,17 @@ def bypass_unsaved_close_prompt(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_qsettings(tmp_path_factory, monkeypatch):
+    from PySide6.QtCore import QSettings
+
+    config_dir = tmp_path_factory.mktemp("qsettings")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_dir))
+    QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, str(config_dir))
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(config_dir))
+    yield config_dir
+
+
+@pytest.fixture(autouse=True)
 def isolate_default_original_guard():
     reset_default_original_guard()
     yield

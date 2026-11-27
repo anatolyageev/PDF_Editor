@@ -133,7 +133,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
 
 ### `T-02`: Add Light/Dark QSS theme system (`ui/theme.py`) and SVG icon helper (`ui/icons.py`)
 
-- **Status:** `TODO`
+- **Status:** `DONE` (2026-11-27)
 - **Depends on:** `T-01`, `T-20`
 - **Goal:** Replace raw unstyled `Fusion` controls with a clean Light/Dark design system, semantic button hierarchy, card-style control panels, and bundled inline SVG icons.
 - **Target files:**
@@ -149,9 +149,7 @@ This backlog breaks down the planned v0.2+ design improvements and PDF writing/e
   - `ui/icons.py` renders bundled inline SVG icons tinted to the active palette without external image files or network calls.
   - Contrast and readability remain clear in both themes; exported/previewed A4 white background remains strictly RGB `(255, 255, 255)`.
   - Side settings appear in the editor and sheet settings in the A4 tab, with one clear primary save action. Keyboard navigation, accessible names and visible focus survive both themes; status does not rely on color alone. Check compact layouts at 1280 × 720; record high-DPI/native Windows checks separately.
-- **Verification:**
-  - `uv run pytest -q tests/test_ui.py`
-  - `uv run pytest -q && uv run ruff check src tests scripts && uv run ruff format --check src tests scripts`
+- **Verification:** `uv run pytest -q tests/test_ui.py` (23 passed, `offscreen`), `uv run pytest -q` (73 passed, `offscreen`), `uv run ruff check src tests scripts` (passed), `uv run ruff format --check src tests scripts` (22 files formatted). Native Windows and 125%/150% HiDPI scaling remain unverified.
 
 ---
 

@@ -187,19 +187,52 @@ reported against commit `051d9b5` before proceeding to `T-02`:
   stale reload non-overwrite, `save()` during modal-dialog sheet invalidation, and
   zero GUI-thread `fingerprint_file`/`validate_source` execution.
 
+### `T-02` (2026-11-27) — Light/Dark QSS theme system & bundled SVG icons
+
+- Added `src/cardprint/ui/theme.py` (`ThemePalette`, `LIGHT_PALETTE`, `DARK_PALETTE`,
+  `build_qpalette`, `build_stylesheet`, `set_widget_property`, `apply_theme`, and
+  `QSettings` load/save helpers using `CardPrint Local` / `Карточки на A4`).
+- Added `src/cardprint/ui/icons.py` rendering bundled monochrome SVG icons via
+  `PySide6.QtSvg.QSvgRenderer` at `1×` and `2×` device pixel ratios with LRU caching
+  and live palette tinting (no external icon assets or network calls).
+- Updated `src/cardprint/app.py`, `src/cardprint/ui/editor.py`, and
+  `src/cardprint/ui/window.py` to apply the persisted theme at startup and live toggle
+  via «Тёмная тема» / «Светлая тема» (without marking workspace dirty), assign explicit
+  `variant` properties (`primary` «Сохранить PDF» CTA, `secondary`, `ghost`, `danger`),
+  show side settings on the Editor tab and A4 layout settings on the Preview tab while
+  keeping status/export visible, replace inline color styles with semantic `status`
+  properties plus `⚠`/`✕`/`✓` text prefixes, preserve canvas-distinct backgrounds while
+  keeping A4 output strictly RGB `(255, 255, 255)`, and preserve keyboard focus and
+  accessible names across themes and compact `1280 × 720` geometry.
+- Added `isolate_qsettings` in `tests/conftest.py` and 3 UI tests in `tests/test_ui.py`
+  covering palette WCAG contrast (`>= 4.5`), SVG icon rendering, theme toggle &
+  `QSettings` persistence, Dark-mode pure-white A4 export, button hierarchy, contextual
+  panels, accessibility, and `1280 × 720` splitter sizing (`Qt offscreen`).
+- Next ready task in [TASKS.md](TASKS.md): `T-03` (drag-and-drop import, visual
+  Front/Back slot cards, and source badges).
+
 ## Recorded implementation verification
 
-The following results were obtained **after the post-`051d9b5` review fixes on
-2026-11-27** (Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native
-Windows and macOS remain unverified):
+The following results were obtained **after completing `T-02` on 2026-11-27**
+(Linux, Python **3.14.2**, `spawn` child process, Qt `offscreen`; native Windows,
+display-backend screenshots, and 125%/150% HiDPI scaling remain separately unverified):
+
+| Check | Result and scope |
+| --- | --- |
+| `uv run pytest -q tests/test_ui.py` | **23 passed** (`14.19s`), Qt `offscreen`. |
+| `uv run pytest -q` | **73 passed** (`19.57s`), Qt `offscreen` (includes the 3 new `T-02` tests in `tests/test_ui.py`). |
+| `uv run ruff check src tests scripts` | All checks passed. |
+| `uv run ruff format --check src tests scripts` | 22 files already formatted. |
+
+`gui_smoke.py` was not rerun for `T-02`; its latest recorded run remains from `T-19` on 2026-11-27.
+
+Previous post-`051d9b5` review-fix checks (2026-11-27, commit `9f2fd30`):
 
 | Check | Result and scope |
 | --- | --- |
 | `uv run pytest -q` | **70 passed** (`18.01s`), Qt `offscreen` (includes the 5 new regression tests in `tests/test_model.py` and `tests/test_ui.py`). |
 | `uv run ruff check src tests scripts` | All checks passed. |
 | `uv run ruff format --check src tests scripts` | 20 files already formatted. |
-
-`gui_smoke.py` was not rerun for these fixes; its latest recorded run remains from `T-19` on 2026-11-27.
 
 Previous `T-20` baseline checks (2026-11-27, commit `051d9b5`):
 
